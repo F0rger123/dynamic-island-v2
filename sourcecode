@@ -3594,7 +3594,16 @@ class Renderer {
         target_->DrawTextW(next.summary.c_str(), static_cast<UINT32>(next.summary.size()), boldTextFormat_.Get(), D2D1::RectF(rect.left + 82 * scale, rect.top + 44 * scale, rect.right - 20 * scale, rect.top + 70 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         std::wstring time = next.start;
         const size_t t = time.find(L'T'); if (t != std::wstring::npos) time = time.substr(t + 1, 5);
-        std::wstring detail = time; if (!next.location.empty()) detail += L"  ·  " + next.location;
+        std::wstring detail = time;
+        const size_t endT = next.end.find(L'T');
+        if (endT != std::wstring::npos) detail += L"–" + next.end.substr(endT + 1, 5);
+        SYSTEMTIME nowLocal = {}; GetLocalTime(&nowLocal);
+        if (next.start.size() >= 16) {
+            const int eventMinutes = _wtoi(next.start.substr(11, 2).c_str()) * 60 + _wtoi(next.start.substr(14, 2).c_str());
+            const int nowMinutes = nowLocal.wHour * 60 + nowLocal.wMinute;
+            if (eventMinutes >= nowMinutes && next.start.substr(0, 10).find(std::to_wstring(nowLocal.wYear)) == 0) detail += L"  ·  in " + std::to_wstring(eventMinutes - nowMinutes) + L"m";
+        }
+        if (!next.location.empty()) detail += L"  ·  " + next.location;
         target_->DrawTextW(detail.c_str(), static_cast<UINT32>(detail.size()), smallTextFormat_.Get(), D2D1::RectF(rect.left + 82 * scale, rect.top + 70 * scale, rect.right - 20 * scale, rect.top + 94 * scale), mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         target_->DrawTextW(L"TODAY", 5, smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.top + 104 * scale, rect.right - 20 * scale, rect.top + 126 * scale), mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
         for (size_t i = 1; i < b.events.size() && i < 4; ++i) {
