@@ -1,11 +1,11 @@
 from pathlib import Path
 
 root = Path(__file__).parents[1]
-source = (root / "sourcecode").read_text()
-bridge = (root / "bridge" / "Program.cs").read_text()
-readme = (root / "README.md").read_text()
+source = (root / "sourcecode").read_text(encoding="utf-8")
+bridge = (root / "bridge" / "Program.cs").read_text(encoding="utf-8")
+readme = (root / "README.md").read_text(encoding="utf-8")
 
-# Regression checks for the requested contracts that can run on Linux.
+# Regression checks for the requested contracts that can run on Linux/Windows.
 assert "kRenderPadY) + 1" in source
 assert "artChangedAt" in source and "recentArtChange" not in source
 assert "GetMonitorDpiScale(next.targetMonitor)" in source
