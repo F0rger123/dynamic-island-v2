@@ -96,7 +96,8 @@ internal sealed class SetupWizard : Form
         var open = Button("Open Google Cloud Console", (_, _) => Open("https://console.cloud.google.com/apis/credentials")); open.Location = new Point(36, 178); p.Controls.Add(open);
         var api = Button("Open Calendar API", (_, _) => Open("https://console.cloud.google.com/apis/library/calendar-json.googleapis.com")); api.Location = new Point(220, 178); p.Controls.Add(api);
         var select = Button("Select credentials JSON", SelectGoogle); select.Location = new Point(36, 225); p.Controls.Add(select);
-        var connect = Button("Connect Google Calendar", (_, _) => {
+        Button connect = null!;
+        connect = Button("Connect Google Calendar", (_, _) => {
             if (CredentialStore.LoadGoogle() is null) { status.Text = "Select credentials JSON first."; return; }
             connect.Enabled = false; status.Text = "Browser sign-in is waiting...";
             _ = Task.Run(async () => { try { await Program.ConnectGoogleCalendar(); BeginInvoke(() => { status.Text = "✓ Google Calendar connected."; connect.Enabled = true; }); } catch (Exception ex) { BeginInvoke(() => { status.Text = "Calendar connection failed: " + ex.Message; connect.Enabled = true; }); } });
