@@ -1,9 +1,9 @@
 from pathlib import Path
 
 root = Path(__file__).parents[1]
-wizard = (root / "bridge" / "SetupWizard.cs").read_text()
-program = (root / "bridge" / "Program.cs").read_text()
-project = (root / "bridge" / "DynamicIslandBridge.csproj").read_text()
+wizard = (root / "bridge" / "SetupWizard.cs").read_text(encoding="utf-8")
+program = (root / "bridge" / "Program.cs").read_text(encoding="utf-8")
+project = (root / "bridge" / "DynamicIslandBridge.csproj").read_text(encoding="utf-8")
 
 assert "ShowIfFirstRun" in program and "--setup" in program
 assert "Select credentials JSON" in wizard
