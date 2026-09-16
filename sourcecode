@@ -453,9 +453,9 @@ void ApplyBridgeMessage(const std::string& json) {
         const std::wstring agent = BridgeJsonString(json, "agent"); b.activeAgent = agent == L"codex" ? 1 : (agent == L"gemini" ? 2 : 0); b.agentStatus = L"Running";
     }
     if (BridgeJsonHas(json, "calendar_auth_required") || BridgeJsonHas(json, "google_oauth")) {
-        b.calendarAuthorized = false; b.calendarError = BridgeJsonString(json, "error");
+        b.calendarAuthorized = false; b.calendarLoading = false; b.calendarError = BridgeJsonString(json, "error");
     } else if (json.find("\"events\":[") != std::string::npos) {
-        b.calendarAuthorized = true; b.calendarError.clear(); b.events.clear();
+        b.calendarAuthorized = true; b.calendarLoading = false; b.calendarError.clear(); b.events.clear();
         size_t p = 0;
         while ((p = json.find("\"summary\":", p)) != std::string::npos && b.events.size() < 12) {
             std::string tail = json.substr(p);
