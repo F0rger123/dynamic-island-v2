@@ -15,7 +15,30 @@
 // ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
-/*...*/
+// {
+//   "Appearance": {
+//     "type": "group", "name": "Appearance", "children": {
+//       "Position": { "type": "select", "name": "Position", "options": [{"value":"top-center","label":"Top center"},{"value":"top-left","label":"Top left"},{"value":"top-right","label":"Top right"},{"value":"bottom-center","label":"Bottom center"}] },
+//       "TargetMonitor": { "type": "text", "name": "Monitor (primary, follow, or 1-based index)", "defaultValue": "primary" },
+//       "OffsetX": { "type": "int", "name": "Offset X", "defaultValue": 0 },
+//       "OffsetY": { "type": "int", "name": "Offset Y", "defaultValue": 0 },
+//       "SizeScale": { "type": "text", "name": "Size scale", "defaultValue": "1.0" },
+//       "AutoDpiScale": { "type": "bool", "name": "Automatic DPI scaling", "defaultValue": true },
+//       "AnimationSpeed": { "type": "select", "name": "Animation speed", "options": [{"value":"normal","label":"Normal"},{"value":"fast","label":"Fast"},{"value":"slow","label":"Slow"}] },
+//       "SmoothMotion": { "type": "bool", "name": "Frame-rate independent motion", "defaultValue": true },
+//       "ExpandOnHover": { "type": "bool", "name": "Expand on hover", "defaultValue": true },
+//       "AlwaysOnTop": { "type": "bool", "name": "Always on top", "defaultValue": true },
+//       "UnhideOnHover": { "type": "bool", "name": "Unhide on hover", "defaultValue": true },
+//       "AutoHideIdleSeconds": { "type": "text", "name": "Auto-hide seconds (0 disables)", "defaultValue": "0" },
+//       "W11Style": { "type": "bool", "name": "Windows 11 corner style", "defaultValue": false }
+//     }
+//   },
+//   "Modules": { "type": "group", "name": "Modules", "children": {
+//     "Media": { "type": "bool", "name": "Media", "defaultValue": true }, "Clipboard": { "type": "bool", "name": "Clipboard", "defaultValue": true }, "Battery": { "type": "bool", "name": "Battery", "defaultValue": true }, "Progress": { "type": "bool", "name": "Progress", "defaultValue": true }, "GameOverlay": { "type": "bool", "name": "Game/system overlay", "defaultValue": false }, "ShowMetricText": { "type": "bool", "name": "Metric text", "defaultValue": true }, "WeatherCity": { "type": "text", "name": "Weather city", "defaultValue": "" }, "WeatherFahrenheit": { "type": "bool", "name": "Weather Fahrenheit", "defaultValue": false }
+//   } },
+//   "Themes": { "type": "group", "name": "Liquid glass", "children": { "AccentColorMode": { "type": "select", "name": "Accent", "options": [{"value":"auto","label":"Auto"},{"value":"system","label":"System"},{"value":"custom","label":"Custom"}] }, "CustomAccentHex": { "type": "text", "name": "Custom accent hex", "defaultValue": "#4cc9f0" }, "TintIntensity": { "type": "int", "name": "Tint intensity", "defaultValue": 72 }, "PillOpacity": { "type": "int", "name": "Glass opacity", "defaultValue": 96 } }
+//   }
+// }
 // ==/WindhawkModSettings==
 
 #define WIN32_LEAN_AND_MEAN
@@ -415,10 +438,25 @@ D2D1_COLOR_F ColorFromHex(std::wstring text, D2D1_COLOR_F fallback) {
         1.0f);
 }
 
-// Returns the DPI scale factor for the primary monitor (1.0 = 96 DPI = 100%)
-float GetPrimaryMonitorDpiScale() {
-    POINT pt = {0, 0};
-    HMONITOR monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+// Returns the effective DPI for the selected monitor (1.0 = 96 DPI).
+float GetMonitorDpiScale(int targetMonitor) {
+    HMONITOR monitor = nullptr;
+    if (targetMonitor == -1) {
+        POINT pt = {};
+        GetCursorPos(&pt);
+        monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    } else if (targetMonitor > 0) {
+        struct Monitors { std::vector<HMONITOR> values; } data;
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR h, HDC, LPRECT, LPARAM p) {
+            reinterpret_cast<Monitors*>(p)->values.push_back(h); return TRUE;
+        }, reinterpret_cast<LPARAM>(&data));
+        const int index = targetMonitor - 1;
+        if (index >= 0 && index < static_cast<int>(data.values.size())) monitor = data.values[index];
+    }
+    if (!monitor) {
+        POINT pt = {0, 0};
+        monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+    }
     UINT dpiX = 96, dpiY = 96;
     using GetDpiForMonitor_t = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
     static auto pGetDpiForMonitor = reinterpret_cast<GetDpiForMonitor_t>(
@@ -459,6 +497,12 @@ void LoadSettings() {
         next.position = Position::BottomCenter;
     }
 
+    // Parse the monitor before applying DPI so scaling follows the selected
+    // display rather than always using the primary monitor.
+    std::wstring mon = GetStringSettingCopy(L"Appearance.TargetMonitor");
+    if (EqualsNoCase(mon, L"follow")) next.targetMonitor = -1;
+    else if (!EqualsNoCase(mon, L"primary") && !mon.empty()) next.targetMonitor = _wtoi(mon.c_str());
+
     const std::wstring scale = GetStringSettingCopy(L"Appearance.SizeScale");
     if (!scale.empty()) {
         wchar_t* end;
@@ -471,7 +515,7 @@ void LoadSettings() {
     // Auto DPI scaling: multiply sizeScale by monitor DPI factor.
     // On a 4K 200% display this doubles the island to the right physical size.
     if (Wh_GetIntSetting(L"Appearance.AutoDpiScale") != 0) {
-        next.sizeScale *= GetPrimaryMonitorDpiScale();
+        next.sizeScale *= GetMonitorDpiScale(next.targetMonitor);
     }
 
     const std::wstring accentMode = GetStringSettingCopy(L"Themes.AccentColorMode");
@@ -514,11 +558,6 @@ void LoadSettings() {
     next.offsetX = Wh_GetIntSetting(L"Appearance.OffsetX");
     next.offsetY = Wh_GetIntSetting(L"Appearance.OffsetY");
 
-    std::wstring mon = GetStringSettingCopy(L"Appearance.TargetMonitor");
-    if (mon == L"primary") next.targetMonitor = 0;
-    else if (mon == L"follow") next.targetMonitor = -1;
-    else next.targetMonitor = _wtoi(mon.c_str());
-
     const int localW11Style = Wh_GetIntValue(L"W11StyleOverride", -1);
     next.w11Style = localW11Style >= 0 ? (localW11Style != 0) : (Wh_GetIntSetting(L"Appearance.W11Style") != 0);
 
@@ -557,9 +596,18 @@ void LoadSettings() {
 }
 
 void EnableBlurBehind(HWND hwnd) {
+    // Layered windows cannot use the old DWM blur region reliably. Ask DWM for
+    // a translucent Mica/Acrylic backdrop when the OS supports it; the D2D
+    // surface remains the portable fallback on Windows 10 and older builds.
+    constexpr DWORD kDwmwaSystemBackdropType = 38;
+    constexpr int kDwmSystemBackdropAcrylic = 3;
+    DwmSetWindowAttribute(hwnd, kDwmwaSystemBackdropType,
+                          &kDwmSystemBackdropAcrylic,
+                          sizeof(kDwmSystemBackdropAcrylic));
+
     DWM_BLURBEHIND blur = {};
     blur.dwFlags = DWM_BB_ENABLE;
-    blur.fEnable = FALSE;
+    blur.fEnable = TRUE;
     DwmEnableBlurBehindWindow(hwnd, &blur);
 }
 
@@ -605,16 +653,19 @@ RECT GetAnchorWorkRect() {
 void PositionOverlayWindow(HWND hwnd, int width, int height) {
     RECT work = GetAnchorWorkRect();
     int x = work.left + (work.right - work.left - width) / 2;
-    int y = work.top + 6;
+    // The work-area origin is already the selected display's top edge. Keep the
+    // collapsed glass visually flush with the display (the 1 px inset avoids
+    // clipping the anti-aliased top highlight on some DWM configurations).
+    int y = work.top + 1;
 
     switch (g_settings.position) {
         case Position::TopLeft:
             x = work.left + 16;
-            y = work.top + 6;
+            y = work.top + 1;
             break;
         case Position::TopRight:
             x = work.right - width - 16;
-            y = work.top + 6;
+            y = work.top + 1;
             break;
         case Position::BottomCenter:
             x = work.left + (work.right - work.left - width) / 2;
@@ -5799,7 +5850,17 @@ DWORD WINAPI RenderThreadProc(void*) {
                             hover, pinned, now);
         }
 
-        WaitForSingleObject(g_stopEvent, 16);
+        // Do not impose a 60 Hz render cap. DwmFlush blocks until the compositor
+        // accepts the frame (and therefore naturally follows 60/120/144/165/240
+        // Hz displays). When idle, wait on the stop event so the tool consumes no
+        // CPU. This keeps animation frame-rate independent without a busy loop.
+        if (needsRender) {
+            if (FAILED(DwmFlush())) {
+                WaitForSingleObject(g_stopEvent, 1);
+            }
+        } else {
+            WaitForSingleObject(g_stopEvent, 100);
+        }
     }
 
     renderer.Shutdown();
