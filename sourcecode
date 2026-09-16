@@ -62,6 +62,7 @@
 #include <wincodec.h>
 #include <shcore.h>
 #include <windowsx.h>
+#include <commctrl.h>
 #include <audioclient.h>
 #include <audiopolicy.h>
 #include <endpointvolume.h>
@@ -313,6 +314,12 @@ struct BridgeSnapshot {
     std::wstring calendarError;
     std::vector<BridgeCalendarEvent> events;
     std::array<bool, 3> agentsDetected{};
+    // Per-agent readiness reported by the bridge:
+    // 0 = not installed, 1 = installed (authentication required),
+    // 2 = ready, 3 = error.
+    std::array<int, 3> agentsState{ 0, 0, 0 };
+    bool geminiApiProvider = false;   // Gemini reports ready via the Gemini API
+    bool geminiLoginUnavailable = false;
     int activeAgent = -1; // 0 Claude, 1 Codex, 2 Gemini
     bool agentRunning = false;
     std::wstring agentStatus;
@@ -439,6 +446,13 @@ std::wstring BridgeJsonString(const std::string& json, const char* key) {
 
 bool BridgeJsonHas(const std::string& json, const char* value) { return json.find(value) != std::string::npos; }
 
+int BridgeAgentStateFromName(const std::wstring& state) {
+    if (state == L"ready") return 2;
+    if (state == L"auth_required") return 1;
+    if (state == L"error") return 3;
+    return 0;
+}
+
 void QueueBridgeRequest(std::string request) {
     std::lock_guard lock(g_bridgeRequestMutex);
     if (g_bridgeRequests.size() < 16) g_bridgeRequests.push_back(std::move(request));
@@ -452,6 +466,7 @@ void ApplyBridgeMessage(const std::string& json) {
     if (BridgeJsonHas(json, "\"ok\":true") && json.find("\"id\":") != std::string::npos && json.find("\"agent\":") != std::string::npos) {
         b.agentJobId = BridgeJsonString(json, "id"); b.agentRunning = true;
         const std::wstring agent = BridgeJsonString(json, "agent"); b.activeAgent = agent == L"codex" ? 1 : (agent == L"gemini" ? 2 : 0); b.agentStatus = L"Running";
+        b.geminiLoginUnavailable = false; // a fresh run clears the previous hint
     }
     if (BridgeJsonHas(json, "calendar_auth_required") || BridgeJsonHas(json, "google_oauth")) {
         b.calendarAuthorized = false; b.calendarLoading = false; b.calendarError = BridgeJsonString(json, "error");
@@ -471,15 +486,40 @@ void ApplyBridgeMessage(const std::string& json) {
         b.agentsDetected[1] = json.find("\"codex\":true") != std::string::npos;
         b.agentsDetected[2] = json.find("\"gemini\":true") != std::string::npos;
     }
+    if (json.find("\"agent_state_claude\"") != std::string::npos) {
+        b.agentsState[0] = BridgeAgentStateFromName(BridgeJsonString(json, "agent_state_claude"));
+        b.agentsState[1] = BridgeAgentStateFromName(BridgeJsonString(json, "agent_state_codex"));
+        b.agentsState[2] = BridgeAgentStateFromName(BridgeJsonString(json, "agent_state_gemini"));
+        b.geminiApiProvider = json.find("\"agent_provider_gemini\":\"api\"") != std::string::npos;
+    }
     if (json.find("\"type\":\"agent\"") != std::string::npos) {
         b.agentRunning = true;
         const std::wstring phase = BridgeJsonString(json, "phase");
-        b.agentStatus = phase == L"running_tool" ? L"Running tool" : (phase == L"tool_result" ? L"Tool complete" : (phase == L"completed" ? L"Completed" : L"Working"));
+        b.agentStatus = phase == L"running_tool" ? L"Running tool" :
+            (phase == L"tool_result" ? L"Tool complete" :
+            (phase == L"reading_file" ? L"Reading file" :
+            (phase == L"editing_file" ? L"Editing file" :
+            (phase == L"running_command" ? L"Running command" :
+            (phase == L"completed" ? L"Completed" :
+            (phase == L"failed" ? L"Failed" :
+            (phase == L"cancelled" ? L"Cancelled" : L"Working")))))));
         const std::wstring data = BridgeJsonString(json, "data");
         if (!data.empty()) { b.agentOutput += data + L"\n"; if (b.agentOutput.size() > 6000) b.agentOutput.erase(0, b.agentOutput.size() - 6000); }
     }
+    if (json.find("\"gemini_login_unavailable\"") != std::string::npos) {
+        b.geminiLoginUnavailable = true;
+        b.agentStatus = L"Gemini CLI login unavailable";
+    }
     if (json.find("\"type\":\"exit\"") != std::string::npos) {
-        b.agentRunning = false; b.agentStatus = BridgeJsonHas(json, "\"code\":0") ? L"Completed" : L"Failed";
+        b.agentRunning = false;
+        const bool okExit = BridgeJsonHas(json, "\"code\":0");
+        // An explicit failed/cancelled phase already reported the real
+        // outcome; do not overwrite it with the process exit code.
+        if (b.agentStatus != L"Failed" && b.agentStatus != L"Cancelled") {
+            b.agentStatus = okExit ? L"Completed" : L"Failed";
+        } else if (!okExit && b.agentStatus != L"Cancelled") {
+            b.agentStatus = L"Failed";
+        }
     }
     g_layoutDirty = true;
 }
@@ -1623,7 +1663,6 @@ DWORD WINAPI NotificationThreadProc(void*) {
     using winrt::Windows::UI::Notifications::Management::UserNotificationListenerAccessStatus;
 
     uint32_t lastSeenId = 0;
-    bool accessLogged = false;
 
     try {
         auto listener = UserNotificationListener::Current();
@@ -2649,51 +2688,7 @@ void SetClickThrough(HWND hwnd, bool clickThrough) {
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle);
 }
 
-void SendVirtualKey(WORD vk) {
-    INPUT inputs[2] = {};
-    inputs[0].type = INPUT_KEYBOARD;
-    inputs[0].ki.wVk = vk;
-    inputs[1].type = INPUT_KEYBOARD;
-    inputs[1].ki.wVk = vk;
-    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(2, inputs, sizeof(INPUT));
-}
-
 void OpenRelevantApp();
-
-void SendMediaCommandAtPoint(HWND hwnd, LPARAM lParam) {
-    RECT rc = {};
-    GetClientRect(hwnd, &rc);
-    const int x = GET_X_LPARAM(lParam);
-    const int y = GET_Y_LPARAM(lParam);
-
-    // Media controls are drawn in the right side of the media pill. Hit-test
-    // using client coordinates so this stays independent of monitor position.
-    // Hit-test positions must match DrawMedia control layout:
-    // cx = rect.right - 42, prev = cx-26, play = cx, next = cx+26
-    // rect.right = rc.right - kRenderPadX, so offset from rc.right:
-    const int centerY = (rc.bottom + rc.top) / 2;
-    const int prevX = rc.right - static_cast<int>(kRenderPadX) - 68;
-    const int playX = rc.right - static_cast<int>(kRenderPadX) - 42;
-    const int nextX = rc.right - static_cast<int>(kRenderPadX) - 16;
-    const int radius = 15;
-
-    auto hit = [&](int cx) {
-        const int dx = x - cx;
-        const int dy = y - centerY;
-        return dx * dx + dy * dy <= radius * radius;
-    };
-
-    if (hit(prevX)) {
-        SendVirtualKey(VK_MEDIA_PREV_TRACK);
-    } else if (hit(playX)) {
-        SendVirtualKey(VK_MEDIA_PLAY_PAUSE);
-    } else if (hit(nextX)) {
-        SendVirtualKey(VK_MEDIA_NEXT_TRACK);
-    } else {
-        OpenRelevantApp();
-    }
-}
 
 void ToggleEndpointMute();
 
@@ -2838,7 +2833,7 @@ void DismissTransientState() {
     Wh_SetIntValue(L"ProgressPercent", -1);
 }
 
-void ShowAgentInput();
+void ShowAgentInput(int prefAgent = -1, bool prefApi = false);
 std::string BridgeJsonEscape(const std::wstring& value);
 
 void ShowContextMenu(HWND hwnd, POINT screenPoint) {
@@ -2864,6 +2859,8 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
     AppendMenuW(menu, MF_STRING, 30, L"Connect Google Calendar");
     AppendMenuW(menu, MF_STRING, 31, L"Run AI agent...");
     AppendMenuW(menu, MF_STRING, 32, L"Stop running agent");
+    AppendMenuW(menu, MF_STRING, 33, L"Use Gemini API Instead");
+    AppendMenuW(menu, MF_STRING, 34, L"Open Google AI Studio");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     // Color theme presets
     AppendMenuW(menu, MF_STRING, 20, L"Theme: OLED Black (default)");
@@ -2892,6 +2889,13 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
             if (!id.empty()) QueueBridgeRequest("{\"op\":\"agent.cancel\",\"id\":\"" + BridgeJsonEscape(id) + "\"}");
             break;
         }
+        case 33:
+            // Open the agent input with Gemini preselected on the API provider.
+            ShowAgentInput(2, true);
+            break;
+        case 34:
+            ShellExecuteW(nullptr, L"open", L"https://aistudio.google.com/apikey", nullptr, nullptr, SW_SHOWNORMAL);
+            break;
         case 1:
             DismissTransientState();
             break;
@@ -3554,25 +3558,6 @@ class Renderer {
         }
     }
 
-    static int GetDaysInMonth(int year, int month) {
-        if (month == 2) {
-            bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-            return leap ? 29 : 28;
-        }
-        if (month == 4 || month == 6 || month == 9 || month == 11) return 30;
-        return 31;
-    }
-
-    static int GetDayOfWeek(int year, int month, int day) {
-        if (month < 3) { month += 12; year -= 1; }
-        int k = year % 100;
-        int j = year / 100;
-        int h = (day + 13 * (month + 1) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
-        return (h + 6) % 7;
-    }
-
-
-
     void DrawBridgeCalendarDashboard(const SharedState& state, D2D1_RECT_F rect, float scale) {
         const auto& b = state.bridge;
         textBrush_->SetOpacity(0.96f); mutedBrush_->SetOpacity(0.62f);
@@ -3623,91 +3608,26 @@ class Renderer {
             const float y = rect.top + (48 + i * 27) * scale;
             const bool selected = b.activeAgent == i;
             const bool available = b.agentsDetected[i];
+            const int agentState = b.agentsState[i];
             if (selected) target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(rect.left + 16 * scale, y - 3 * scale, rect.right - 16 * scale, y + 21 * scale), 8 * scale, 8 * scale), tintBrush_.Get());
             target_->DrawTextW(names[i], static_cast<UINT32>(wcslen(names[i])), textFormat_.Get(), D2D1::RectF(rect.left + 24 * scale, y, rect.left + 180 * scale, y + 20 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
-            const wchar_t* stateText = available ? (b.agentRunning && selected ? L"running" : L"ready") : L"not found";
-            target_->DrawTextW(stateText, static_cast<UINT32>(wcslen(stateText)), smallTextFormat_.Get(), D2D1::RectF(rect.right - 92 * scale, y + 2 * scale, rect.right - 22 * scale, y + 20 * scale), available ? accentBrush_.Get() : mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            const wchar_t* stateText =
+                (b.agentRunning && selected) ? L"running" :
+                (agentState == 2) ? (i == 2 && b.geminiApiProvider ? L"ready · api" : L"ready") :
+                (agentState == 1) ? L"auth required" :
+                (agentState == 3) ? L"error" :
+                (available ? L"ready" : L"not installed");
+            target_->DrawTextW(stateText, static_cast<UINT32>(wcslen(stateText)), smallTextFormat_.Get(), D2D1::RectF(rect.right - 108 * scale, y + 2 * scale, rect.right - 22 * scale, y + 20 * scale), (available || agentState == 2) ? accentBrush_.Get() : mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        if (b.geminiLoginUnavailable) {
+            target_->DrawTextW(L"Gemini CLI login unavailable for this account.", 43, smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.bottom - 46 * scale, rect.right - 22 * scale, rect.bottom - 28 * scale), accentBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            target_->DrawTextW(L"Use Gemini API Instead · right-click the island.", 43, smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.bottom - 28 * scale, rect.right - 22 * scale, rect.bottom - 10 * scale), accentBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            return;
         }
         std::wstring status = b.online ? (b.agentStatus.empty() ? L"Select an agent · click to launch" : b.agentStatus) : L"Bridge offline";
         if (b.agentRunning) status += L"  ·  right-click Stop";
         target_->DrawTextW(status.c_str(), static_cast<UINT32>(status.size()), smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.bottom - 46 * scale, rect.right - 22 * scale, rect.bottom - 26 * scale), mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         if (!b.agentOutput.empty()) target_->DrawTextW(b.agentOutput.c_str(), static_cast<UINT32>(std::min<size_t>(b.agentOutput.size(), 180)), smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.bottom - 24 * scale, rect.right - 22 * scale, rect.bottom - 6 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-    }
-
-    void DrawCalendarDashboard(const SharedState& state, D2D1_RECT_F rect, const Settings& settings, double now, float scale, SYSTEMTIME& local) {
-        ComPtr<ID2D1SolidColorBrush> calBg;
-        target_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.04f * settingsOpacity_), &calBg);
-        D2D1_RECT_F leftBlock = D2D1::RectF(rect.left + 22.0f * scale, rect.top + 16.0f * scale,
-                                            rect.left + 115.0f * scale, rect.bottom - 22.0f * scale);
-        target_->FillRoundedRectangle(D2D1::RoundedRect(leftBlock, 12.0f * scale, 12.0f * scale), calBg.Get());
-        
-        ComPtr<ID2D1SolidColorBrush> calHeader;
-        target_->CreateSolidColorBrush(D2D1::ColorF(0.85f, 0.25f, 0.20f, 0.9f * settingsOpacity_), &calHeader);
-        
-        wchar_t monthName[32] = {};
-        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &local, L"MMMM", monthName, ARRAYSIZE(monthName), nullptr);
-        for (int i = 0; monthName[i]; ++i) monthName[i] = towupper(monthName[i]);
-        
-        target_->DrawTextW(monthName, static_cast<UINT32>(wcslen(monthName)), boldTextFormat_.Get(),
-                           D2D1::RectF(leftBlock.left, leftBlock.top + 6.0f * scale, leftBlock.right, leftBlock.top + 24.0f * scale),
-                           calHeader.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
-
-        wchar_t yearStr[16] = {};
-        swprintf_s(yearStr, L"%d", local.wYear);
-        mutedBrush_->SetOpacity(0.45f);
-        target_->DrawTextW(yearStr, static_cast<UINT32>(wcslen(yearStr)), boldTextFormat_.Get(),
-                           D2D1::RectF(leftBlock.left, leftBlock.top + 20.0f * scale, leftBlock.right, leftBlock.top + 38.0f * scale),
-                           mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
-
-        wchar_t dayStr[16] = {};
-        swprintf_s(dayStr, L"%d", local.wDay);
-        textBrush_->SetOpacity(0.96f);
-        target_->DrawTextW(dayStr, static_cast<UINT32>(wcslen(dayStr)), hugeTextFormat_.Get(),
-                           D2D1::RectF(leftBlock.left, leftBlock.top + 30.0f * scale, leftBlock.right, leftBlock.top + 80.0f * scale),
-                           textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
-
-        wchar_t weekdayName[32] = {};
-        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &local, L"dddd", weekdayName, ARRAYSIZE(weekdayName), nullptr);
-        mutedBrush_->SetOpacity(0.75f);
-        target_->DrawTextW(weekdayName, static_cast<UINT32>(wcslen(weekdayName)), boldTextFormat_.Get(),
-                           D2D1::RectF(leftBlock.left, leftBlock.bottom - 22.0f * scale, leftBlock.right, leftBlock.bottom),
-                           mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
-
-        // Right Grid
-        const float gridStart = rect.left + 144.0f * scale;
-        const float gridTop = rect.top + 30.0f * scale;
-        const float colW = 31.0f * scale;
-        const float rowH = 18.0f * scale;
-        const wchar_t* days[] = {L"S", L"M", L"T", L"W", L"T", L"F", L"S"};
-        
-        for (int i = 0; i < 7; ++i) {
-            D2D1_RECT_F cell = D2D1::RectF(gridStart + i * colW, gridTop, gridStart + (i+1)*colW, gridTop + rowH);
-            ComPtr<ID2D1SolidColorBrush> brush = (i == 0 || i == 6) ? calHeader : mutedBrush_;
-            target_->DrawTextW(days[i], 1, boldTextFormat_.Get(), cell, brush.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
-        }
-
-        int startDay = GetDayOfWeek(local.wYear, local.wMonth, 1);
-        int totalDays = GetDaysInMonth(local.wYear, local.wMonth);
-        
-        int row = 1;
-        int col = startDay;
-        textBrush_->SetOpacity(0.85f);
-        for (int d = 1; d <= totalDays; ++d) {
-            D2D1_RECT_F cell = D2D1::RectF(gridStart + col * colW, gridTop + row * rowH + 4.0f * scale, 
-                                           gridStart + (col+1)*colW, gridTop + (row+1)*rowH + 4.0f * scale);
-            
-            if (d == local.wDay) {
-                target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cell.left + colW*0.5f, cell.top + rowH*0.5f), 10.0f*scale, 10.0f*scale), calHeader.Get());
-                target_->DrawTextW(std::to_wstring(d).c_str(), static_cast<UINT32>(std::to_wstring(d).length()), boldTextFormat_.Get(), cell, textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
-            } else {
-                ComPtr<ID2D1SolidColorBrush> dBrush = (col == 0 || col == 6) ? calHeader : textBrush_;
-                if (col == 0 || col == 6) dBrush->SetOpacity(0.6f);
-                target_->DrawTextW(std::to_wstring(d).c_str(), static_cast<UINT32>(std::to_wstring(d).length()), boldTextFormat_.Get(), cell, dBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
-            }
-            
-            col++;
-            if (col > 6) { col = 0; row++; }
-        }
     }
 
     void DrawWeatherDashboard(const SharedState& state, D2D1_RECT_F rect, const Settings& settings, double now, float scale, bool hasWeather, const std::wstring& wIcon, const std::wstring& wText) {
@@ -3773,8 +3693,6 @@ class Renderer {
             return;
         }
         target_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        
-        bool privacyActive = state.system.micActive || state.system.cameraActive;
         if (!clockFormat_) return;
 
         SYSTEMTIME local = {};
@@ -4360,8 +4278,10 @@ class Renderer {
         if (expandedAlpha > 0.01f && mask && layer) {
             target_->PushLayer(D2D1::LayerParameters(rect, mask.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(), expandedAlpha, nullptr, D2D1_LAYER_OPTIONS_NONE), layer.Get());
             
-            int tab = g_idleTab % 3;
-            if (tab < 0) tab += 3;
+            // Unified page routing while media is active:
+            //   0 Media, 1 Google Calendar, 2 AI Agents, 3 Weather/System
+            int tab = g_idleTab % 4;
+            if (tab < 0) tab += 4;
 
             if (tab == 0) {
                 // Expanded Apple DI media: large square art on left, text center.
@@ -4460,9 +4380,13 @@ class Renderer {
                                   D2D1::Point2F(cx, cy),
                                   D2D1::Point2F(cx + 64.0f, cy));
             } else if (tab == 1) {
-                SYSTEMTIME local = {}; GetLocalTime(&local);
-                DrawCalendarDashboard(state, rect, g_settings, now, 1.0f, local);
+                // Google Calendar via the bridge (connection + auth state,
+                // next event with title/start/end/countdown/location, today's
+                // upcoming events).
+                DrawBridgeCalendarDashboard(state, rect, 1.0f);
             } else if (tab == 2) {
+                DrawAgentsDashboard(state, rect, 1.0f);
+            } else if (tab == 3) {
                 bool hasWeather = state.weather.hasData && (now - state.weather.lastUpdated < 3600.0);
                 std::wstring wIcon = L"🌡️"; std::wstring wText = L"Loading...";
                 if (hasWeather) {
@@ -4489,9 +4413,11 @@ class Renderer {
             target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.85f * settingsOpacity_), &activeDot);
             target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.25f * settingsOpacity_), &inactiveDot);
 
-            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY - spacing), r, r), tab == 0 ? activeDot.Get() : inactiveDot.Get());
-            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY), r, r), tab == 1 ? activeDot.Get() : inactiveDot.Get());
-            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY + spacing), r, r), tab == 2 ? activeDot.Get() : inactiveDot.Get());
+            // Four pages while media is active: Media / Calendar / Agents / Weather.
+            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY - 1.5f * spacing), r, r), tab == 0 ? activeDot.Get() : inactiveDot.Get());
+            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY - 0.5f * spacing), r, r), tab == 1 ? activeDot.Get() : inactiveDot.Get());
+            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY + 0.5f * spacing), r, r), tab == 2 ? activeDot.Get() : inactiveDot.Get());
+            target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY + 1.5f * spacing), r, r), tab == 3 ? activeDot.Get() : inactiveDot.Get());
 
             target_->PopLayer();
         }
@@ -5457,8 +5383,10 @@ DWORD WINAPI KeyboardThreadProc(void*) {
     return 0;
 }
 
-struct AgentInputControls { HWND window = nullptr; HWND agent = nullptr; HWND project = nullptr; HWND prompt = nullptr; };
+struct AgentInputControls { HWND window = nullptr; HWND agent = nullptr; HWND provider = nullptr; HWND project = nullptr; HWND prompt = nullptr; };
 AgentInputControls g_agentInput;
+int g_agentInputPrefAgent = -1;
+bool g_agentInputPrefApi = false;
 
 std::string BridgeWideToUtf8(const std::wstring& value) {
     if (value.empty()) return {};
@@ -5473,6 +5401,18 @@ std::string BridgeJsonEscape(const std::wstring& value) {
     return out;
 }
 void CloseAgentInput(HWND hwnd) { if (hwnd) DestroyWindow(hwnd); g_agentInput = {}; if (g_hwnd) PostMessageW(g_hwnd, WM_APP_LAYOUT_CHANGED, 0, 0); }
+void ApplyAgentInputProviderSelection(HWND hwnd) {
+    (void)hwnd;
+    if (!g_agentInput.provider || !g_agentInput.agent) return;
+    const int agentIndex = static_cast<int>(SendMessageW(g_agentInput.agent, CB_GETCURSEL, 0, 0));
+    EnableWindow(g_agentInput.provider, agentIndex == 2);
+    if (agentIndex != 2) {
+        SendMessageW(g_agentInput.provider, CB_SETCURSEL, 0, 0);
+    } else if (g_agentInputPrefApi) {
+        SendMessageW(g_agentInput.provider, CB_SETCURSEL, 1, 0);
+        g_agentInputPrefApi = false;
+    }
+}
 LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -5480,16 +5420,28 @@ LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             CreateWindowW(L"STATIC", L"Agent", WS_CHILD | WS_VISIBLE, 16, 14, 70, 22, hwnd, nullptr, nullptr, nullptr);
             g_agentInput.agent = CreateWindowW(L"COMBOBOX", L"Claude Code", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 88, 10, 190, 180, hwnd, reinterpret_cast<HMENU>(101), nullptr, nullptr);
             SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Claude Code")); SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Codex")); SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Gemini")); SendMessageW(g_agentInput.agent, CB_SETCURSEL, 0, 0);
-            CreateWindowW(L"STATIC", L"Project folder", WS_CHILD | WS_VISIBLE, 16, 50, 100, 22, hwnd, nullptr, nullptr, nullptr);
-            g_agentInput.project = CreateWindowW(L"EDIT", L"C:\\", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 116, 46, 330, 26, hwnd, reinterpret_cast<HMENU>(102), nullptr, nullptr);
-            CreateWindowW(L"BUTTON", L"Browse", WS_CHILD | WS_VISIBLE, 452, 46, 78, 26, hwnd, reinterpret_cast<HMENU>(103), nullptr, nullptr);
-            CreateWindowW(L"STATIC", L"Prompt", WS_CHILD | WS_VISIBLE, 16, 86, 80, 22, hwnd, nullptr, nullptr, nullptr);
-            g_agentInput.prompt = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL, 16, 112, 514, 150, hwnd, reinterpret_cast<HMENU>(104), nullptr, nullptr);
-            CreateWindowW(L"BUTTON", L"Run agent", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 342, 278, 92, 30, hwnd, reinterpret_cast<HMENU>(105), nullptr, nullptr);
-            CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE, 438, 278, 92, 30, hwnd, reinterpret_cast<HMENU>(106), nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"Provider", WS_CHILD | WS_VISIBLE, 16, 44, 70, 22, hwnd, nullptr, nullptr, nullptr);
+            g_agentInput.provider = CreateWindowW(L"COMBOBOX", L"CLI (login)", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 88, 40, 190, 140, hwnd, reinterpret_cast<HMENU>(107), nullptr, nullptr);
+            SendMessageW(g_agentInput.provider, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"CLI (login)")); SendMessageW(g_agentInput.provider, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Gemini API")); SendMessageW(g_agentInput.provider, CB_SETCURSEL, 0, 0);
+            CreateWindowW(L"STATIC", L"Project folder", WS_CHILD | WS_VISIBLE, 16, 74, 100, 22, hwnd, nullptr, nullptr, nullptr);
+            g_agentInput.project = CreateWindowW(L"EDIT", L"C:\\", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 116, 70, 330, 26, hwnd, reinterpret_cast<HMENU>(102), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Browse", WS_CHILD | WS_VISIBLE, 452, 70, 78, 26, hwnd, reinterpret_cast<HMENU>(103), nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"Prompt", WS_CHILD | WS_VISIBLE, 16, 108, 80, 22, hwnd, nullptr, nullptr, nullptr);
+            g_agentInput.prompt = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL, 16, 134, 514, 140, hwnd, reinterpret_cast<HMENU>(104), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Run agent", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 342, 284, 92, 30, hwnd, reinterpret_cast<HMENU>(105), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE, 438, 284, 92, 30, hwnd, reinterpret_cast<HMENU>(106), nullptr, nullptr);
+            if (g_agentInputPrefAgent >= 0 && g_agentInputPrefAgent < 3) {
+                SendMessageW(g_agentInput.agent, CB_SETCURSEL, g_agentInputPrefAgent, 0);
+                g_agentInputPrefAgent = -1;
+            }
+            ApplyAgentInputProviderSelection(hwnd);
             return 0;
         }
         case WM_COMMAND:
+            if (HIWORD(wParam) == CBN_SELCHANGE && LOWORD(wParam) == 101) {
+                ApplyAgentInputProviderSelection(hwnd);
+                return 0;
+            }
             if (LOWORD(wParam) == 103) {
                 BROWSEINFOW bi = {}; bi.hwndOwner = hwnd; bi.lpszTitle = L"Choose an agent project folder"; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
                 PIDLIST_ABSOLUTE id = SHBrowseForFolderW(&bi); if (id) { wchar_t path[MAX_PATH] = {}; SHGetPathFromIDListW(id, path); SetWindowTextW(g_agentInput.project, path); CoTaskMemFree(id); } return 0;
@@ -5497,8 +5449,19 @@ LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (LOWORD(wParam) == 106) { CloseAgentInput(hwnd); return 0; }
             if (LOWORD(wParam) == 105) {
                 wchar_t project[MAX_PATH] = {}, prompt[32768] = {}; GetWindowTextW(g_agentInput.project, project, ARRAYSIZE(project)); GetWindowTextW(g_agentInput.prompt, prompt, ARRAYSIZE(prompt));
-                int index = static_cast<int>(SendMessageW(g_agentInput.agent, CB_GETCURSEL, 0, 0)); const char* names[] = {"claude", "codex", "gemini"};
-                if (index >= 0 && index < 3 && project[0] && prompt[0]) { std::string request = "{\"op\":\"agent.start\",\"agent\":\"" + std::string(names[index]) + "\",\"project\":\"" + BridgeJsonEscape(project) + "\",\"prompt\":\"" + BridgeJsonEscape(prompt) + "\"}"; { std::lock_guard lock(g_stateMutex); g_state.bridge.activeAgent = index; g_state.bridge.agentOutput.clear(); g_state.bridge.agentStatus = L"Starting"; } QueueBridgeRequest(std::move(request)); CloseAgentInput(hwnd); } return 0;
+                int index = static_cast<int>(SendMessageW(g_agentInput.agent, CB_GETCURSEL, 0, 0));
+                int provider = (index == 2) ? static_cast<int>(SendMessageW(g_agentInput.provider, CB_GETCURSEL, 0, 0)) : 0;
+                const char* names[] = {"claude", "codex", "gemini"};
+                if (index >= 0 && index < 3 && project[0] && prompt[0]) {
+                    // agent.start format; Gemini API provider adds "provider":"api":
+                    // {"op":"agent.start","agent":"gemini","provider":"api","project":"...","prompt":"..."}
+                    std::string request = "{\"op\":\"agent.start\",\"agent\":\"" + std::string(names[index]);
+                    if (index == 2 && provider == 1) request += "\",\"provider\":\"api\"";
+                    request += "\",\"project\":\"" + BridgeJsonEscape(project) + "\",\"prompt\":\"" + BridgeJsonEscape(prompt) + "\"}";
+                    { std::lock_guard lock(g_stateMutex); g_state.bridge.activeAgent = index; g_state.bridge.agentOutput.clear(); g_state.bridge.agentStatus = L"Starting"; g_state.bridge.geminiLoginUnavailable = false; }
+                    QueueBridgeRequest(std::move(request)); CloseAgentInput(hwnd);
+                }
+                return 0;
             }
             return 0;
         case WM_CLOSE: CloseAgentInput(hwnd); return 0;
@@ -5509,13 +5472,15 @@ LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 DWORD WINAPI AgentInputThreadProc(void*) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     static const wchar_t kClass[] = L"DynamicIsland.AgentInput"; WNDCLASSW wc = {}; wc.lpfnWndProc = AgentInputWndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = kClass; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); RegisterClassW(&wc);
-    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kClass, L"Run local AI agent", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 560, 360, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kClass, L"Run local AI agent", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 560, 352, nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) { UnregisterClassW(kClass, wc.hInstance); if (SUCCEEDED(hr)) CoUninitialize(); return 0; }
     ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd);
     MSG msg; while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); } UnregisterClassW(kClass, wc.hInstance); if (SUCCEEDED(hr)) CoUninitialize(); return 0;
 }
-void ShowAgentInput() {
+void ShowAgentInput(int prefAgent, bool prefApi) {
     if (g_agentInput.window && IsWindow(g_agentInput.window)) { SetForegroundWindow(g_agentInput.window); return; }
+    g_agentInputPrefAgent = prefAgent;
+    g_agentInputPrefApi = prefApi;
     HANDLE thread = CreateThread(nullptr, 0, AgentInputThreadProc, nullptr, 0, nullptr);
     if (thread) CloseHandle(thread);
 }
@@ -5610,7 +5575,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
                 const float width = static_cast<float>(clientRect.right - clientRect.left);
 
-                if (mediaActive && height > 60.0f && (g_idleTab % 3) == 0) {
+                if (mediaActive && height > 60.0f && (g_idleTab % 4) == 0) {
                     float totalScale = (GetDpiForWindow(hwnd) / 96.0f) * g_settings.sizeScale;
                     float cx = width / 2.0f;
                     float cy = height / 2.0f;
@@ -5666,7 +5631,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
                 const float width = static_cast<float>(clientRect.right - clientRect.left);
 
-                if (mediaActive && height > 60.0f && (g_idleTab % 3) == 0) {
+                if (mediaActive && height > 60.0f && (g_idleTab % 4) == 0) {
                     float totalScale = (GetDpiForWindow(hwnd) / 96.0f) * g_settings.sizeScale;
                     float cx = width / 2.0f;
                     float cy = height / 2.0f;
@@ -5760,7 +5725,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 std::lock_guard lock(g_stateMutex);
                 mediaActive = g_settings.media && g_state.media.available;
             }
-            int tabCount = mediaActive ? 3 : 2;
+            int tabCount = mediaActive ? 4 : 3;
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             if (delta > 0) {
                 if (g_idleTab > 0) g_idleTab--;

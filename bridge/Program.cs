@@ -9,15 +9,16 @@ using System.Text;
 using System.Text.Json;
 
 // DynamicIslandBridge: local-only broker for Calendar and installed coding agents.
-// Protocol: one UTF-8 JSON object per line over \\.\pipe\DynamicIslandBridge-v2.
+// Protocol: one UTF-8 JSON object per line over \\\\.\\pipe\\DynamicIslandBridge-v2.
 // No command received here is executed by a shell. Agent arguments are passed as
 // ProcessStartInfo.ArgumentList, and project roots must be existing directories.
 internal static class Program
 {
     const string PipeName = "DynamicIslandBridge-v2";
     static readonly string DataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DynamicIslandBridge");
-    static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    internal static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     static readonly Dictionary<string, Process> Jobs = new(StringComparer.Ordinal);
+    static readonly Dictionary<string, CancellationTokenSource> ApiJobs = new(StringComparer.Ordinal);
     static readonly object JobsLock = new();
 
     public static async Task Main()
@@ -60,17 +61,40 @@ internal static class Program
 
     static void SafeLog(string message) { try { File.AppendAllText(Path.Combine(DataDir, "bridge.log"), DateTimeOffset.Now.ToString("O") + " " + message + Environment.NewLine); } catch { } }
 
+    // Agent streams and the request/response loop share this writer; serialize
+    // writes so each JSON line reaches the pipe intact even while an agent is
+    // streaming and new requests arrive.
+    static readonly object WriteLock = new();
+
     static async Task Dispatch(JsonElement r, StreamWriter w)
     {
         var op = r.TryGetProperty("op", out var o) ? o.GetString() : null;
         SafeLog(op ?? "invalid");
         switch (op)
         {
-            case "status": await Send(w, new { ok = true, bridge = "online", version = "2.0.0", agents = DetectAgents() }); break;
-            case "diagnostics": await Send(w, new { ok = true, bridge = "online", version = "2.0.0", runtime = Environment.Version.ToString(), claude = FindOrNull("claude"), codex = FindOrNull("codex"), gemini = FindOrNull("gemini"), git = FindOrNull("git"), setup = SetupState.IsComplete }); break;
+            case "status": await Send(w, StatusPayload()); break;
+            case "diagnostics":
+            {
+                var claude = AgentReadiness.Check("claude"); var codex = AgentReadiness.Check("codex"); var gemini = AgentReadiness.Check("gemini");
+                await Send(w, new
+                {
+                    ok = true, bridge = "online", version = "2.0.0", runtime = Environment.Version.ToString(),
+                    claude = FindOrNull("claude"), codex = FindOrNull("codex"), gemini = FindOrNull("gemini"),
+                    git = FindOrNull("git"), npm = FindOrNull("npm"), setup = SetupState.IsComplete,
+                    agent_state_claude = claude.State, agent_state_codex = codex.State, agent_state_gemini = gemini.State,
+                    agent_provider_gemini = gemini.Provider ?? "none",
+                });
+                break;
+            }
             case "calendar.auth": await Send(w, new { ok = await Calendar.Auth(), state = "authorized" }); break;
             case "calendar.today": await Send(w, new { ok = true, events = await Calendar.Today() }); break;
-            case "gemini.api.test": await Send(w, new { ok = await TestGeminiApi(), provider = "gemini-api" }); break;
+            case "gemini.api.test":
+            {
+                if (!GeminiApi.HasKey()) { await Send(w, new { ok = false, error = "gemini_api_key_required", provider = "gemini-api" }); break; }
+                var ok = await GeminiApi.TestAsync();
+                await Send(w, new { ok, provider = "gemini-api" });
+                break;
+            }
             case "agent.start": await StartAgent(r, w); break;
             case "agent.cancel": await Cancel(r, w); break;
             case "agent.resume": await ResumeAgent(r, w); break;
@@ -78,23 +102,36 @@ internal static class Program
         }
     }
 
+    // Per-agent readiness is reported to the island as flat keys
+    // (agent_state_<agent>) so the C++ client can parse them without a JSON
+    // library. "ready" also covers the Gemini API fallback provider.
+    static Dictionary<string, object?> StatusPayload()
+    {
+        var claude = AgentReadiness.Check("claude");
+        var codex = AgentReadiness.Check("codex");
+        var gemini = AgentReadiness.Check("gemini");
+        return new Dictionary<string, object?>
+        {
+            ["ok"] = true,
+            ["bridge"] = "online",
+            ["version"] = "2.0.0",
+            ["agents"] = new Dictionary<string, bool>
+            {
+                ["claude"] = claude.State != AgentReadiness.NotFound,
+                ["codex"] = codex.State != AgentReadiness.NotFound,
+                ["gemini"] = gemini.State != AgentReadiness.NotFound,
+            },
+            ["agent_state_claude"] = claude.State,
+            ["agent_state_codex"] = codex.State,
+            ["agent_state_gemini"] = gemini.State,
+            ["agent_provider_gemini"] = gemini.Provider ?? "none",
+        };
+    }
+
     static string? FindOrNull(string name) { try { return CliDiscovery.Find(name); } catch { return null; } }
 
-    static async Task<bool> TestGeminiApi()
-    {
-        var key = SecretStore.LoadGemini(); if (string.IsNullOrWhiteSpace(key)) throw new InvalidOperationException("gemini_api_key_required");
-        using var http = new HttpClient(); using var body = new StringContent("{\"contents\":[{\"parts\":[{\"text\":\"Reply with READY only.\"}]}]}", Encoding.UTF8, "application/json");
-        using var response = await http.PostAsync("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + Uri.EscapeDataString(key), body); return response.IsSuccessStatusCode;
-    }
-
     static ProcessStartInfo CreateStartInfo(string file, string root, IEnumerable<string> args)
-    {
-        var isBatch = file.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".bat", StringComparison.OrdinalIgnoreCase);
-        var psi = new ProcessStartInfo(isBatch ? Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe" : file) { WorkingDirectory = root, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
-        if (isBatch) { psi.ArgumentList.Add("/d"); psi.ArgumentList.Add("/s"); psi.ArgumentList.Add("/c"); psi.ArgumentList.Add(file); }
-        foreach (var arg in args) psi.ArgumentList.Add(arg);
-        return psi;
-    }
+        => ProcessLauncher.Build(file, args, root);
 
     static async Task StartAgent(JsonElement r, StreamWriter w)
     {
@@ -102,13 +139,38 @@ internal static class Program
         var root = FullDirectory(Required(r, "project"));
         var prompt = Required(r, "prompt");
         if (prompt.Length > 32_000) throw new InvalidDataException("prompt_too_large");
+        var provider = r.TryGetProperty("provider", out var pv) && pv.ValueKind == JsonValueKind.String ? pv.GetString()?.ToLowerInvariant() : null;
+
+        if (agent == "gemini" && provider == "api")
+        {
+            if (!GeminiApi.HasKey()) throw new InvalidDataException("gemini_api_key_required");
+            var id = Guid.NewGuid().ToString("N");
+            var cts = new CancellationTokenSource();
+            lock (JobsLock) ApiJobs[id] = cts;
+            await Send(w, new { ok = true, id, agent, project = root, provider = "api" });
+            _ = RunGeminiApiJob(id, root, prompt, w, cts);
+            return;
+        }
+        if (provider is not null) throw new InvalidDataException("provider_not_supported");
+        if (agent is not ("claude" or "codex" or "gemini")) throw new InvalidDataException("unsupported_agent");
+
         var (file, args) = AgentCommand(agent, prompt);
         var psi = CreateStartInfo(file, root, args);
         var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
         if (!p.Start()) throw new InvalidOperationException("agent_start_failed");
         var id = Guid.NewGuid().ToString("N"); lock (JobsLock) Jobs[id] = p;
         await Send(w, new { ok = true, id, agent, project = root });
-        _ = StreamOutput(id, p, w);
+        _ = StreamOutput(id, p, w, agent);
+    }
+
+    static async Task RunGeminiApiJob(string id, string root, string prompt, StreamWriter w, CancellationTokenSource cts)
+    {
+        var outcome = "failed";
+        try { outcome = await GeminiApiAgent.Run(id, root, prompt, w, cts.Token); }
+        catch { outcome = "failed"; }
+        try { await Send(w, new { type = "exit", id, code = outcome == "failed" ? 1 : 0, provider = "api" }); } catch { }
+        lock (JobsLock) ApiJobs.Remove(id);
+        cts.Dispose();
     }
 
     static object NormalizeEvent(string line)
@@ -132,16 +194,67 @@ internal static class Program
         catch { return new { phase = "working", text = line, raw = line }; }
     }
 
-    static async Task StreamOutput(string id, Process p, StreamWriter w)
+    static readonly string[] GeminiLoginErrors =
     {
-        async Task Pump(StreamReader s, string stream) { string? line; while ((line = await s.ReadLineAsync()) != null) try { await Send(w, new { type = "agent", id, stream, normalized = NormalizeEvent(line), data = line }); } catch { break; } }
+        "not logged in", "login required", "log in", "sign in", "authentication",
+        "unauthorized", "unauthenticated", "access denied", "permission denied",
+    };
+
+    static bool LooksLikeGeminiLoginError(string line)
+    {
+        var lower = line.ToLowerInvariant();
+        foreach (var needle in GeminiLoginErrors)
+        {
+            if (lower.Contains(needle)) return true;
+        }
+        return lower.Contains(" 401") || lower.Contains("\"401\"");
+    }
+
+    static async Task StreamOutput(string id, Process p, StreamWriter w, string agent)
+    {
+        var authFailed = false;
+        async Task Pump(StreamReader s, string stream)
+        {
+            string? line;
+            while ((line = await s.ReadLineAsync()) != null)
+            {
+                if (agent == "gemini" && LooksLikeGeminiLoginError(line)) authFailed = true;
+                try { await Send(w, new { type = "agent", id, stream, normalized = NormalizeEvent(line), data = line }); }
+                catch { break; }
+            }
+        }
         await Task.WhenAll(Pump(p.StandardOutput, "stdout"), Pump(p.StandardError, "stderr"));
-        await p.WaitForExitAsync(); try { await Send(w, new { type = "exit", id, code = p.ExitCode }); } catch { }
-        lock (JobsLock) Jobs.Remove(id); p.Dispose();
+        await p.WaitForExitAsync();
+        if (agent == "gemini" && authFailed && p.ExitCode != 0)
+        {
+            try { await Send(w, new { type = "gemini_login_unavailable", id, agent = "gemini" }); } catch { }
+        }
+        try { await Send(w, new { type = "exit", id, code = p.ExitCode }); } catch { }
+        lock (JobsLock) Jobs.Remove(id);
+        p.Dispose();
     }
 
     static async Task Cancel(JsonElement r, StreamWriter w)
-    { var id = Required(r, "id"); lock (JobsLock) if (Jobs.TryGetValue(id, out var p)) { try { if (!p.HasExited) p.Kill(true); } catch { } } await Send(w, new { ok = true, id, state = "cancelling" }); }
+    {
+        var id = Required(r, "id");
+        CancellationTokenSource? apiJob = null;
+        lock (JobsLock) ApiJobs.TryGetValue(id, out apiJob);
+        if (apiJob is not null)
+        {
+            try { apiJob.Cancel(); } catch { }
+            await Send(w, new { ok = true, id, state = "cancelling" });
+            return;
+        }
+        lock (JobsLock)
+        {
+            if (Jobs.TryGetValue(id, out var p))
+            {
+                try { if (!p.HasExited) p.Kill(true); } catch { }
+            }
+        }
+        await Send(w, new { ok = true, id, state = "cancelling" });
+    }
+
     static async Task ResumeAgent(JsonElement r, StreamWriter w)
     {
         var agent = Required(r, "agent").ToLowerInvariant(); var session = Required(r, "session"); var root = FullDirectory(Required(r, "project")); var prompt = r.TryGetProperty("prompt", out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() ?? "Continue" : "Continue";
@@ -154,7 +267,7 @@ internal static class Program
         };
         var psi = CreateStartInfo(file, root, args);
         var process = new Process { StartInfo = psi }; if (!process.Start()) throw new InvalidOperationException("agent_resume_failed");
-        var id = Guid.NewGuid().ToString("N"); lock (JobsLock) Jobs[id] = process; await Send(w, new { ok = true, id, agent, resumed = session }); _ = StreamOutput(id, process, w);
+        var id = Guid.NewGuid().ToString("N"); lock (JobsLock) Jobs[id] = process; await Send(w, new { ok = true, id, agent, resumed = session }); _ = StreamOutput(id, process, w, agent);
     }
 
     static (string, string[]) AgentCommand(string agent, string prompt) => agent switch
@@ -165,20 +278,18 @@ internal static class Program
         _ => throw new InvalidDataException("unsupported_agent")
     };
 
-    static Dictionary<string, bool> DetectAgents() => new() { ["claude"] = Exists("claude"), ["codex"] = Exists("codex"), ["gemini"] = Exists("gemini") };
-    static bool Exists(string n) { try { Find(n); return true; } catch { return false; } }
-    static string Find(string n)
-    {
-        var dirs = new List<string>((Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries));
-        dirs.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".npm-global"));
-        dirs.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm"));
-        dirs.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs"));
-        foreach (var dir in dirs.Distinct(StringComparer.OrdinalIgnoreCase)) foreach (var ext in new[] { ".exe", ".cmd", ".bat", "" }) { var p = Path.Combine(dir, n + ext); if (File.Exists(p)) return p; }
-        throw new FileNotFoundException($"{n}_not_found");
-    }
+    static string Find(string n) => CliDiscovery.Find(n) ?? throw new FileNotFoundException($"{n}_not_found");
+
     static string Required(JsonElement r, string n) => r.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(v.GetString()) ? v.GetString()! : throw new InvalidDataException($"missing_{n}");
     static string FullDirectory(string value) { var p = Path.GetFullPath(value); if (!Directory.Exists(p) || p.StartsWith("\\\\")) throw new InvalidDataException("invalid_project_directory"); return p; }
-    static Task Send(StreamWriter w, object value) => w.WriteLineAsync(JsonSerializer.Serialize(value, JsonOptions));
+    static async Task Send(StreamWriter w, object value)
+    {
+        var line = JsonSerializer.Serialize(value, JsonOptions);
+        lock (WriteLock)
+        {
+            await w.WriteLineAsync(line).ConfigureAwait(false);
+        }
+    }
 
     static class Calendar
     {

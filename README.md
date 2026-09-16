@@ -39,7 +39,12 @@ are newline-delimited JSON. Example status request:
 The Windhawk source includes a non-blocking named-pipe client. It reconnects
 from a worker thread, consumes status/calendar/agent events, drives the Calendar
 and Agents expanded dashboards, and leaves the overlay functional when the
-bridge is offline. Clicking the Agents page opens a native input window for
+bridge is offline. While media is active the expanded island has four pages —
+Media, Google Calendar, AI Agents, Weather/System — and without media it keeps
+the Calendar/Agents/Weather pages, so bridge content is reachable either way.
+The local month calendar is gone; the Calendar page is the bridge's dashboard
+(connection + auth state, next event with title/start/end/countdown/location,
+and today's upcoming events). Clicking the Agents page opens a native input window for
 agent, project folder, multiline prompt, and Run. A production installer should
 start the bridge at logon using a per-user Task Scheduler entry, not administrator
 privileges.
@@ -87,6 +92,29 @@ The bridge does not invent session ids; the host must retain the id emitted by a
 CLI or selected by the user. Full-terminal handoff is intentionally left to the
 host UI.
 
+### Gemini API provider
+
+Gemini can also run as a real coding agent through the Gemini API instead of
+the CLI. Store a key in the setup wizard (DPAPI), then send:
+
+```json
+{"op":"agent.start","agent":"gemini","provider":"api","project":"C:\\\\work\\\\repo","prompt":"Fix the failing tests."}
+```
+
+The agent streams `streamGenerateContent` SSE responses, executes the model's
+tool calls (list_files, read_file, search, write_file, edit_file, git_status,
+git_diff, run_command) inside the project root, and reports the same
+normalized phases (`working`, `reading_file`, `editing_file`, `running_tool`,
+`running_command`, `tool_result`, `completed`, `failed`, `cancelled`). Tool
+paths may not leave the project root (no `..`, no absolute external paths, no
+UNC, no symlink/reparse escapes) and `run_command` is allowlisted to
+git, dotnet, npm, node, python, pytest with shell metacharacters rejected.
+`agent.cancel` works for API jobs through a cancellation token. The API key is
+sent only as the `x-goog-api-key` header, is never logged, and if the Gemini
+CLI itself cannot log in the island offers **Use Gemini API Instead** plus a
+shortcut to <https://aistudio.google.com/apikey>. With a working API key the
+bridge reports Gemini as ready even when no CLI is installed.
+
 ## Verification performed
 
 - Reviewed the complete 6,085-line Windhawk source and confirmed the checkout
@@ -113,13 +141,25 @@ DynamicIslandBridge.exe --setup
 
 The wizard provides:
 
-- Windows/.NET/Windhawk/CLI checks.
-- Claude, Codex, Gemini, and Git discovery in PATH and common Windows locations.
+- Windows/.NET/Windhawk/CLI checks, refreshed live per provider (Rescan/Test).
+- Claude, Codex, Gemini, and Git discovery across PATH, `%APPDATA%\npm`,
+  `%LOCALAPPDATA%\npm`, `%USERPROFILE%\.npm-global`, `%LOCALAPPDATA%\Programs`,
+  `npm prefix -g` / `npm root -g`, and a `where.exe` fallback. Executables may
+  be `.exe`, `.cmd`, `.bat`, `.ps1`, or extensionless; npm-installed CLIs are
+  detected in place, so a reinstall is never required.
+- Per-provider controls: Rescan, Test (runs a real harmless `--version`),
+  Login (opens the CLI's own sign-in console), Locate manually (pick the
+  executable; stored per user and preferred on the next scan), and for Codex
+  and Gemini an Install button that asks first, runs
+  `npm install -g @openai/codex` / `@google/gemini-cli`, and auto-rescans.
+- Ready / Installed·authentication required / Not installed / Error states per
+  provider, so a missing login is never mistaken for a missing install.
 - Copyable official install commands.
 - Official setup links opened directly in the browser.
 - Google Desktop OAuth JSON selection and DPAPI-protected client credentials.
 - Browser OAuth connection from the wizard.
-- Optional DPAPI-protected Gemini API-key storage.
+- Optional DPAPI-protected Gemini API-key storage (the Gemini API is a real,
+  selectable agent provider — not just a key test).
 - Per-user Windows startup configuration.
 - Skip/setup-later behavior without blocking the base Dynamic Island.
 
