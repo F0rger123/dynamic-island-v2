@@ -86,17 +86,51 @@ internal static class Program
         _ = StreamOutput(id, p, w);
     }
 
+    static object NormalizeEvent(string line)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(line); var r = doc.RootElement;
+            var kind = r.TryGetProperty("type", out var t) ? t.GetString() : null;
+            var text = r.TryGetProperty("message", out var m) ? m.ToString() : line;
+            var phase = kind switch
+            {
+                "tool_use" or "function_call" => "running_tool",
+                "tool_result" or "function_return" => "tool_result",
+                "assistant" or "message" => "working",
+                "result" or "completed" => "completed",
+                "error" => "failed",
+                _ => "working"
+            };
+            return new { phase, text, raw = line };
+        }
+        catch { return new { phase = "working", text = line, raw = line }; }
+    }
+
     static async Task StreamOutput(string id, Process p, StreamWriter w)
     {
-        async Task Pump(StreamReader s, string stream) { string? line; while ((line = await s.ReadLineAsync()) != null) try { await Send(w, new { type = "agent", id, stream, data = line }); } catch { break; } }
+        async Task Pump(StreamReader s, string stream) { string? line; while ((line = await s.ReadLineAsync()) != null) try { await Send(w, new { type = "agent", id, stream, normalized = NormalizeEvent(line), data = line }); } catch { break; } }
         await Task.WhenAll(Pump(p.StandardOutput, "stdout"), Pump(p.StandardError, "stderr"));
         await p.WaitForExitAsync(); try { await Send(w, new { type = "exit", id, code = p.ExitCode }); } catch { }
         lock (JobsLock) Jobs.Remove(id); p.Dispose();
     }
 
     static async Task Cancel(JsonElement r, StreamWriter w)
-    { var id = Required(r, "id"); lock (JobsLock) if (Jobs.Remove(id, out var p)) { try { p.Kill(true); } catch { } p.Dispose(); } await Send(w, new { ok = true, id }); }
-    static async Task ResumeAgent(JsonElement r, StreamWriter w) { await Send(w, new { ok = false, error = "resume_not_available", detail = "The selected CLI does not expose a resumable session." }); }
+    { var id = Required(r, "id"); lock (JobsLock) if (Jobs.TryGetValue(id, out var p)) { try { if (!p.HasExited) p.Kill(true); } catch { } } await Send(w, new { ok = true, id, state = "cancelling" }); }
+    static async Task ResumeAgent(JsonElement r, StreamWriter w)
+    {
+        var agent = Required(r, "agent").ToLowerInvariant(); var session = Required(r, "session"); var root = FullDirectory(Required(r, "project")); var prompt = r.TryGetProperty("prompt", out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() ?? "Continue" : "Continue";
+        var file = Find(agent); string[] args = agent switch
+        {
+            "claude" => new[] { "-p", prompt, "--resume", session, "--output-format", "stream-json", "--verbose" },
+            "codex" => new[] { "exec", "resume", session, prompt, "--json" },
+            "gemini" => new[] { "--resume", session, "-p", prompt, "--output-format", "stream-json" },
+            _ => throw new InvalidDataException("unsupported_agent")
+        };
+        var psi = new ProcessStartInfo(file) { WorkingDirectory = root, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true }; foreach (var arg in args) psi.ArgumentList.Add(arg);
+        var process = new Process { StartInfo = psi }; if (!process.Start()) throw new InvalidOperationException("agent_resume_failed");
+        var id = Guid.NewGuid().ToString("N"); lock (JobsLock) Jobs[id] = process; await Send(w, new { ok = true, id, agent, resumed = session }); _ = StreamOutput(id, process, w);
+    }
 
     static (string, string[]) AgentCommand(string agent, string prompt) => agent switch
     {
@@ -141,9 +175,16 @@ internal static class Program
             var refreshed = new Token(root.GetProperty("access_token").GetString()!, t.refresh_token, DateTimeOffset.UtcNow.ToUnixTimeSeconds() + root.GetProperty("expires_in").GetInt64());
             File.WriteAllBytes(TokenFile, ProtectedData.Protect(JsonSerializer.SerializeToUtf8Bytes(refreshed), null, DataProtectionScope.CurrentUser)); return refreshed.access_token;
         }
+        static string StartValue(JsonElement item, string key)
+        {
+            if (!item.TryGetProperty(key, out var value)) return "";
+            if (value.TryGetProperty("dateTime", out var dateTime)) return dateTime.GetString() ?? "";
+            if (value.TryGetProperty("date", out var date)) return date.GetString() ?? "";
+            return value.ToString();
+        }
         public static async Task<object[]> Today()
         {
-            var accessToken = await AccessToken(); using var http = new HttpClient(); http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken); var now = DateTimeOffset.Now; var url = $"https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin={Uri.EscapeDataString(now.ToUniversalTime().ToString("o"))}&timeMax={Uri.EscapeDataString(now.Date.AddDays(1).ToUniversalTime().ToString("o"))}"; var doc = JsonDocument.Parse(await http.GetStringAsync(url)); return doc.RootElement.GetProperty("items").EnumerateArray().Select(x => (object)new { id = x.GetProperty("id").GetString(), summary = x.TryGetProperty("summary", out var s) ? s.GetString() : "(untitled)", start = x.GetProperty("start").ToString(), end = x.GetProperty("end").ToString(), location = x.TryGetProperty("location", out var l) ? l.GetString() : null }).ToArray();
+            var accessToken = await AccessToken(); using var http = new HttpClient(); http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken); var now = DateTimeOffset.Now; var url = $"https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin={Uri.EscapeDataString(now.ToUniversalTime().ToString("o"))}&timeMax={Uri.EscapeDataString(now.Date.AddDays(1).ToUniversalTime().ToString("o"))}"; var doc = JsonDocument.Parse(await http.GetStringAsync(url)); return doc.RootElement.GetProperty("items").EnumerateArray().Select(x => (object)new { id = x.GetProperty("id").GetString(), summary = x.TryGetProperty("summary", out var s) ? s.GetString() : "(untitled)", start = StartValue(x, "start"), end = StartValue(x, "end"), location = x.TryGetProperty("location", out var l) ? l.GetString() : null }).ToArray();
         }
     }
 }

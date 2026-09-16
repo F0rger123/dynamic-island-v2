@@ -36,9 +36,12 @@ are newline-delimited JSON. Example status request:
 '{"op":"status"}' | # use a named-pipe client; this is intentionally not TCP
 ```
 
-The Windhawk source currently contains the visual/UI side and the bridge is a
-separately deployable integration boundary. A production installer should start
-the bridge at logon using a per-user Task Scheduler entry, not administrator
+The Windhawk source includes a non-blocking named-pipe client. It reconnects
+from a worker thread, consumes status/calendar/agent events, drives the Calendar
+and Agents expanded dashboards, and leaves the overlay functional when the
+bridge is offline. Clicking the Agents page opens a native input window for
+agent, project folder, multiline prompt, and Run. A production installer should
+start the bridge at logon using a per-user Task Scheduler entry, not administrator
 privileges.
 
 ## Google Calendar setup (read-only)
@@ -78,9 +81,11 @@ supported flow, then send:
 Use `codex` or `gemini` for the `agent` field. Output is streamed as JSON lines
 with `stdout`/`stderr` and an exit event. `agent.cancel` accepts the returned
 job id. Project paths must be local existing directories; no shell is used and
-there is no remote command endpoint. The current bridge reports resume as
-unsupported until each CLI's session store can be safely and consistently
-mapped; full-terminal handoff is also intentionally left to the host UI.
+there is no remote command endpoint. Resume accepts an explicit CLI session id and uses the documented command
+forms for Claude (`--resume`), Codex (`exec resume`), and Gemini (`--resume`).
+The bridge does not invent session ids; the host must retain the id emitted by a
+CLI or selected by the user. Full-terminal handoff is intentionally left to the
+host UI.
 
 ## Verification performed
 

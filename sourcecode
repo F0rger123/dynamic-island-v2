@@ -34,7 +34,7 @@
 //     }
 //   },
 //   "Modules": { "type": "group", "name": "Modules", "children": {
-//     "Media": { "type": "bool", "name": "Media", "defaultValue": true }, "Clipboard": { "type": "bool", "name": "Clipboard", "defaultValue": true }, "Battery": { "type": "bool", "name": "Battery", "defaultValue": true }, "Progress": { "type": "bool", "name": "Progress", "defaultValue": true }, "GameOverlay": { "type": "bool", "name": "Game/system overlay", "defaultValue": false }, "ShowMetricText": { "type": "bool", "name": "Metric text", "defaultValue": true }, "WeatherCity": { "type": "text", "name": "Weather city", "defaultValue": "" }, "WeatherFahrenheit": { "type": "bool", "name": "Weather Fahrenheit", "defaultValue": false }
+//     "Media": { "type": "bool", "name": "Media", "defaultValue": true }, "Clipboard": { "type": "bool", "name": "Clipboard", "defaultValue": true }, "Battery": { "type": "bool", "name": "Battery", "defaultValue": true }, "Progress": { "type": "bool", "name": "Progress", "defaultValue": true }, "Calendar": { "type": "bool", "name": "Google Calendar", "defaultValue": true }, "Agents": { "type": "bool", "name": "AI Agents", "defaultValue": true }, "GameOverlay": { "type": "bool", "name": "Game/system overlay", "defaultValue": false }, "ShowMetricText": { "type": "bool", "name": "Metric text", "defaultValue": true }, "WeatherCity": { "type": "text", "name": "Weather city", "defaultValue": "" }, "WeatherFahrenheit": { "type": "bool", "name": "Weather Fahrenheit", "defaultValue": false }
 //   } },
 //   "Themes": { "type": "group", "name": "Liquid glass", "children": { "AccentColorMode": { "type": "select", "name": "Accent", "options": [{"value":"auto","label":"Auto"},{"value":"system","label":"System"},{"value":"custom","label":"Custom"}] }, "CustomAccentHex": { "type": "text", "name": "Custom accent hex", "defaultValue": "#4cc9f0" }, "TintIntensity": { "type": "int", "name": "Tint intensity", "defaultValue": 72 }, "PillOpacity": { "type": "int", "name": "Glass opacity", "defaultValue": 96 } }
 //   }
@@ -54,6 +54,7 @@
 #include <unknwn.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <setupapi.h>
 #include <dbt.h>
 #include <d2d1.h>
@@ -157,6 +158,8 @@ struct Settings {
     bool clipboard = true;
     bool battery = true;
     bool progress = true;
+    bool calendar = true;
+    bool agents = true;
     float tintOpacity = 0.72f;
     float pillOpacity = 0.96f;
     bool gameOverlay = false;
@@ -295,7 +298,30 @@ struct WeatherSnapshot {
     double lastUpdated = 0.0;
 };
 
+struct BridgeCalendarEvent {
+    std::wstring summary;
+    std::wstring start;
+    std::wstring end;
+    std::wstring location;
+};
+
+struct BridgeSnapshot {
+    bool online = false;
+    bool calendarAuthorized = false;
+    bool calendarLoading = false;
+    std::wstring calendarError;
+    std::vector<BridgeCalendarEvent> events;
+    std::array<bool, 3> agentsDetected{};
+    int activeAgent = -1; // 0 Claude, 1 Codex, 2 Gemini
+    bool agentRunning = false;
+    std::wstring agentStatus;
+    std::wstring agentOutput;
+    std::wstring agentJobId;
+    double lastUpdate = 0.0;
+};
+
 struct SharedState {
+    BridgeSnapshot bridge;
     MediaSnapshot media;
     ClipboardSnapshot clipboard;
     NotificationSnapshot notification;
@@ -360,11 +386,15 @@ HANDLE g_mediaThread = nullptr;
 HANDLE g_audioThread = nullptr;
 HANDLE g_weatherThread = nullptr;
 HANDLE g_notificationThread = nullptr;
+HANDLE g_bridgeThread = nullptr;
 std::atomic<bool> g_running = false;
+std::atomic<bool> g_bridgeStop = false;
 std::atomic<int> g_idleTab = 0;
 std::atomic<bool> g_layoutDirty = true;
 std::atomic<bool> g_clickExpanded = false;
 std::atomic<int> g_pressedMediaButton = -1;
+std::mutex g_bridgeRequestMutex;
+std::vector<std::string> g_bridgeRequests;
 FILETIME g_prevIdleTime = {};
 FILETIME g_prevKernelTime = {};
 FILETIME g_prevUserTime = {};
@@ -379,7 +409,111 @@ constexpr GUID kSubTypeIeeeFloat = {
     {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71},
 };
 
+double NowSeconds();
 
+std::wstring BridgeUtf8ToWide(const std::string& value) {
+    if (value.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), out.data(), n);
+    return out;
+}
+
+std::wstring BridgeJsonString(const std::string& json, const char* key) {
+    const std::string needle = std::string("\"") + key + "\":\"";
+    const size_t start = json.find(needle);
+    if (start == std::string::npos) return {};
+    size_t p = start + needle.size();
+    std::string value;
+    bool escaped = false;
+    for (; p < json.size(); ++p) {
+        char c = json[p];
+        if (escaped) { value += (c == 'n' ? '\n' : c); escaped = false; continue; }
+        if (c == '\\') { escaped = true; continue; }
+        if (c == '"') break;
+        value += c;
+    }
+    return BridgeUtf8ToWide(value);
+}
+
+bool BridgeJsonHas(const std::string& json, const char* value) { return json.find(value) != std::string::npos; }
+
+void QueueBridgeRequest(std::string request) {
+    std::lock_guard lock(g_bridgeRequestMutex);
+    if (g_bridgeRequests.size() < 16) g_bridgeRequests.push_back(std::move(request));
+}
+
+void ApplyBridgeMessage(const std::string& json) {
+    std::lock_guard lock(g_stateMutex);
+    auto& b = g_state.bridge;
+    b.lastUpdate = NowSeconds();
+    if (BridgeJsonHas(json, "\"bridge\":\"online\"")) b.online = true;
+    if (BridgeJsonHas(json, "\"ok\":true") && json.find("\"id\":") != std::string::npos && json.find("\"agent\":") != std::string::npos) {
+        b.agentJobId = BridgeJsonString(json, "id"); b.agentRunning = true;
+        const std::wstring agent = BridgeJsonString(json, "agent"); b.activeAgent = agent == L"codex" ? 1 : (agent == L"gemini" ? 2 : 0); b.agentStatus = L"Running";
+    }
+    if (BridgeJsonHas(json, "calendar_auth_required") || BridgeJsonHas(json, "google_oauth")) {
+        b.calendarAuthorized = false; b.calendarError = BridgeJsonString(json, "error");
+    } else if (json.find("\"events\":[") != std::string::npos) {
+        b.calendarAuthorized = true; b.calendarError.clear(); b.events.clear();
+        size_t p = 0;
+        while ((p = json.find("\"summary\":", p)) != std::string::npos && b.events.size() < 12) {
+            std::string tail = json.substr(p);
+            BridgeCalendarEvent e;
+            e.summary = BridgeJsonString(tail, "summary"); e.start = BridgeJsonString(tail, "start");
+            e.end = BridgeJsonString(tail, "end"); e.location = BridgeJsonString(tail, "location");
+            b.events.push_back(std::move(e)); p += 10;
+        }
+    }
+    if (json.find("\"agents\":") != std::string::npos) {
+        b.agentsDetected[0] = json.find("\"claude\":true") != std::string::npos;
+        b.agentsDetected[1] = json.find("\"codex\":true") != std::string::npos;
+        b.agentsDetected[2] = json.find("\"gemini\":true") != std::string::npos;
+    }
+    if (json.find("\"type\":\"agent\"") != std::string::npos) {
+        b.agentRunning = true;
+        const std::wstring phase = BridgeJsonString(json, "phase");
+        b.agentStatus = phase == L"running_tool" ? L"Running tool" : (phase == L"tool_result" ? L"Tool complete" : (phase == L"completed" ? L"Completed" : L"Working"));
+        const std::wstring data = BridgeJsonString(json, "data");
+        if (!data.empty()) { b.agentOutput += data + L"\n"; if (b.agentOutput.size() > 6000) b.agentOutput.erase(0, b.agentOutput.size() - 6000); }
+    }
+    if (json.find("\"type\":\"exit\"") != std::string::npos) {
+        b.agentRunning = false; b.agentStatus = BridgeJsonHas(json, "\"code\":0") ? L"Completed" : L"Failed";
+    }
+    g_layoutDirty = true;
+}
+
+DWORD WINAPI BridgeThreadProc(void*) {
+    while (!g_bridgeStop.load() && WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
+        if (!WaitNamedPipeW(L"\\\\.\\pipe\\DynamicIslandBridge-v2", 250)) {
+            std::lock_guard lock(g_stateMutex); g_state.bridge.online = false; g_state.bridge.calendarLoading = false;
+            WaitForSingleObject(g_stopEvent, 1000); continue;
+        }
+        HANDLE pipe = CreateFileW(L"\\\\.\\pipe\\DynamicIslandBridge-v2", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (pipe == INVALID_HANDLE_VALUE) { WaitForSingleObject(g_stopEvent, 500); continue; }
+        DWORD mode = PIPE_READMODE_BYTE; SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr);
+        { std::lock_guard lock(g_stateMutex); g_state.bridge.online = true; g_state.bridge.calendarLoading = true; }
+        auto send = [&](const std::string& request) { DWORD written = 0; std::string line = request + "\n"; return WriteFile(pipe, line.data(), static_cast<DWORD>(line.size()), &written, nullptr) != FALSE; };
+        send("{\"op\":\"status\"}"); send("{\"op\":\"calendar.today\"}");
+        double nextPoll = NowSeconds() + 10.0;
+        bool connected = true;
+        while (connected && !g_bridgeStop.load() && WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
+            { std::lock_guard lock(g_bridgeRequestMutex); for (const auto& request : g_bridgeRequests) send(request); g_bridgeRequests.clear(); }
+            DWORD available = 0;
+            const BOOL peekOk = PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr);
+            if (peekOk && available) {
+                std::string line; char ch = 0; DWORD read = 0;
+                while (ReadFile(pipe, &ch, 1, &read, nullptr) && read == 1 && ch != '\n' && line.size() < 65536) line += ch;
+                if (!line.empty()) ApplyBridgeMessage(line);
+            } else if (!peekOk && GetLastError() == ERROR_BROKEN_PIPE) connected = false;
+            if (NowSeconds() >= nextPoll) { send("{\"op\":\"status\"}"); send("{\"op\":\"calendar.today\"}"); nextPoll = NowSeconds() + 10.0; }
+            WaitForSingleObject(g_stopEvent, 50);
+        }
+        CloseHandle(pipe);
+        std::lock_guard lock(g_stateMutex); g_state.bridge.online = false;
+    }
+    return 0;
+}
 
 double NowSeconds() {
     using clock = std::chrono::steady_clock;
@@ -539,6 +673,8 @@ void LoadSettings() {
     next.clipboard = Wh_GetIntSetting(L"Modules.Clipboard") != 0;
     next.battery = Wh_GetIntSetting(L"Modules.Battery") != 0;
     next.progress = Wh_GetIntSetting(L"Modules.Progress") != 0;
+    next.calendar = Wh_GetIntSetting(L"Modules.Calendar") != 0;
+    next.agents = Wh_GetIntSetting(L"Modules.Agents") != 0;
     next.tintOpacity = Clamp(Wh_GetIntSetting(L"Themes.TintIntensity") / 100.0f, 0.0f, 1.0f);
     const int settingOpacity = Wh_GetIntSetting(L"Themes.PillOpacity");
     const int localOpacity = Wh_GetIntValue(L"PillOpacityOverride", -1);
@@ -2700,6 +2836,9 @@ void DismissTransientState() {
     Wh_SetIntValue(L"ProgressPercent", -1);
 }
 
+void ShowAgentInput();
+std::string BridgeJsonEscape(const std::wstring& value);
+
 void ShowContextMenu(HWND hwnd, POINT screenPoint) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, 1, L"Dismiss");
@@ -2720,6 +2859,10 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
     AppendMenuW(menu, MF_STRING, 7, L"Transparency 55%");
     AppendMenuW(menu, MF_STRING, 8, L"Reset transparency");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 30, L"Connect Google Calendar");
+    AppendMenuW(menu, MF_STRING, 31, L"Run AI agent...");
+    AppendMenuW(menu, MF_STRING, 32, L"Stop running agent");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     // Color theme presets
     AppendMenuW(menu, MF_STRING, 20, L"Theme: OLED Black (default)");
     AppendMenuW(menu, MF_STRING, 21, L"Theme: Dark Gray");
@@ -2735,6 +2878,18 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
     DestroyMenu(menu);
 
     switch (cmd) {
+        case 30:
+            QueueBridgeRequest("{\"op\":\"calendar.auth\"}");
+            break;
+        case 31:
+            ShowAgentInput();
+            break;
+        case 32: {
+            std::wstring id;
+            { std::lock_guard lock(g_stateMutex); id = g_state.bridge.agentJobId; }
+            if (!id.empty()) QueueBridgeRequest("{\"op\":\"agent.cancel\",\"id\":\"" + BridgeJsonEscape(id) + "\"}");
+            break;
+        }
         case 1:
             DismissTransientState();
             break;
@@ -3201,6 +3356,13 @@ class Renderer {
         float unH = (rect.bottom - rect.top) * invScale;
         D2D1_RECT_F unscaledRect = D2D1::RectF(pillCenter.x - unW * 0.5f, pillCenter.y - unH * 0.5f, pillCenter.x + unW * 0.5f, pillCenter.y + unH * 0.5f);
 
+        if (activity.kind == IslandKind::Idle && unH < 60.0f && state.bridge.agentRunning) {
+            const wchar_t* marker = state.bridge.activeAgent == 1 ? L"X" : (state.bridge.activeAgent == 2 ? L"G" : L"C");
+            accentBrush_->SetOpacity(0.95f);
+            target_->DrawTextW(marker, 1, boldTextFormat_.Get(), D2D1::RectF(unscaledRect.left + 18, unscaledRect.top + 7, unscaledRect.left + 42, unscaledRect.bottom - 5), accentBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            accentBrush_->SetOpacity(1.0f);
+        }
+
         switch (activity.kind) {
             case IslandKind::Media:
                 DrawMedia(state, unscaledRect, now);
@@ -3409,6 +3571,58 @@ class Renderer {
 
 
 
+    void DrawBridgeCalendarDashboard(const SharedState& state, D2D1_RECT_F rect, float scale) {
+        const auto& b = state.bridge;
+        textBrush_->SetOpacity(0.96f); mutedBrush_->SetOpacity(0.62f);
+        target_->DrawTextW(L"GOOGLE CALENDAR", 15, boldTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.top + 14 * scale, rect.right - 20 * scale, rect.top + 36 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        if (!b.online) {
+            target_->DrawTextW(L"Bridge offline · start DynamicIslandBridge.exe", 39, textFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.top + 56 * scale, rect.right - 18 * scale, rect.top + 86 * scale), mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            return;
+        }
+        if (!b.calendarAuthorized) {
+            const std::wstring message = b.calendarError.empty() ? L"Connect Google Calendar from the bridge" : L"Calendar authorization required";
+            target_->DrawTextW(message.c_str(), static_cast<UINT32>(message.size()), textFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.top + 56 * scale, rect.right - 18 * scale, rect.top + 90 * scale), mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            target_->DrawTextW(L"Right-click · Connect", 21, smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.bottom - 38 * scale, rect.right - 18 * scale, rect.bottom - 14 * scale), accentBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            return;
+        }
+        if (b.events.empty()) {
+            target_->DrawTextW(L"No more events today", 19, textFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.top + 60 * scale, rect.right - 18 * scale, rect.top + 90 * scale), mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            return;
+        }
+        const auto& next = b.events.front();
+        target_->DrawTextW(L"NEXT", 4, smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.top + 48 * scale, rect.left + 80 * scale, rect.top + 68 * scale), accentBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        target_->DrawTextW(next.summary.c_str(), static_cast<UINT32>(next.summary.size()), boldTextFormat_.Get(), D2D1::RectF(rect.left + 82 * scale, rect.top + 44 * scale, rect.right - 20 * scale, rect.top + 70 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        std::wstring time = next.start;
+        const size_t t = time.find(L'T'); if (t != std::wstring::npos) time = time.substr(t + 1, 5);
+        std::wstring detail = time; if (!next.location.empty()) detail += L"  ·  " + next.location;
+        target_->DrawTextW(detail.c_str(), static_cast<UINT32>(detail.size()), smallTextFormat_.Get(), D2D1::RectF(rect.left + 82 * scale, rect.top + 70 * scale, rect.right - 20 * scale, rect.top + 94 * scale), mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        target_->DrawTextW(L"TODAY", 5, smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.top + 104 * scale, rect.right - 20 * scale, rect.top + 126 * scale), mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        for (size_t i = 1; i < b.events.size() && i < 4; ++i) {
+            const float y = rect.top + (126 + static_cast<float>(i - 1) * 18) * scale;
+            target_->DrawTextW(b.events[i].summary.c_str(), static_cast<UINT32>(b.events[i].summary.size()), smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, y, rect.right - 20 * scale, y + 18 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+        textBrush_->SetOpacity(0.90f); mutedBrush_->SetOpacity(0.58f);
+    }
+
+    void DrawAgentsDashboard(const SharedState& state, D2D1_RECT_F rect, float scale) {
+        const auto& b = state.bridge;
+        target_->DrawTextW(L"AI AGENTS", 9, boldTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.top + 14 * scale, rect.right - 20 * scale, rect.top + 36 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        const wchar_t* names[] = {L"C  Claude Code", L"X  Codex", L"G  Gemini"};
+        for (int i = 0; i < 3; ++i) {
+            const float y = rect.top + (48 + i * 27) * scale;
+            const bool selected = b.activeAgent == i;
+            const bool available = b.agentsDetected[i];
+            if (selected) target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(rect.left + 16 * scale, y - 3 * scale, rect.right - 16 * scale, y + 21 * scale), 8 * scale, 8 * scale), tintBrush_.Get());
+            target_->DrawTextW(names[i], static_cast<UINT32>(wcslen(names[i])), textFormat_.Get(), D2D1::RectF(rect.left + 24 * scale, y, rect.left + 180 * scale, y + 20 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            const wchar_t* stateText = available ? (b.agentRunning && selected ? L"running" : L"ready") : L"not found";
+            target_->DrawTextW(stateText, static_cast<UINT32>(wcslen(stateText)), smallTextFormat_.Get(), D2D1::RectF(rect.right - 92 * scale, y + 2 * scale, rect.right - 22 * scale, y + 20 * scale), available ? accentBrush_.Get() : mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        std::wstring status = b.online ? (b.agentStatus.empty() ? L"Select an agent · click to launch" : b.agentStatus) : L"Bridge offline";
+        if (b.agentRunning) status += L"  ·  right-click Stop";
+        target_->DrawTextW(status.c_str(), static_cast<UINT32>(status.size()), smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.bottom - 46 * scale, rect.right - 22 * scale, rect.bottom - 26 * scale), mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        if (!b.agentOutput.empty()) target_->DrawTextW(b.agentOutput.c_str(), static_cast<UINT32>(std::min<size_t>(b.agentOutput.size(), 180)), smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.bottom - 24 * scale, rect.right - 22 * scale, rect.bottom - 6 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
     void DrawCalendarDashboard(const SharedState& state, D2D1_RECT_F rect, const Settings& settings, double now, float scale, SYSTEMTIME& local) {
         ComPtr<ID2D1SolidColorBrush> calBg;
         target_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.04f * settingsOpacity_), &calBg);
@@ -3597,10 +3811,11 @@ class Renderer {
         }
 
         // Expanded Mode
-        int tab = g_idleTab % 2;
-        if (tab < 0) tab += 2;
+        int tab = g_idleTab % 3;
+        if (tab < 0) tab += 3;
 
-        if (tab == 0) DrawCalendarDashboard(state, rect, settings, now, scale, local);
+        if (tab == 0) DrawBridgeCalendarDashboard(state, rect, scale);
+        else if (tab == 1) DrawAgentsDashboard(state, rect, scale);
         else DrawWeatherDashboard(state, rect, settings, now, scale, hasWeather, wIcon, wText);
 
         // Pagination dots (Vertical on the right edge)
@@ -3619,8 +3834,9 @@ class Renderer {
         target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.85f * settingsOpacity_), &activeDot);
         target_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0.25f * settingsOpacity_), &inactiveDot);
 
-        target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY - spacing * 0.5f), r, r), tab == 0 ? activeDot.Get() : inactiveDot.Get());
-        target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY + spacing * 0.5f), r, r), tab == 1 ? activeDot.Get() : inactiveDot.Get());
+        target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY - spacing), r, r), tab == 0 ? activeDot.Get() : inactiveDot.Get());
+        target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY), r, r), tab == 1 ? activeDot.Get() : inactiveDot.Get());
+        target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY + spacing), r, r), tab == 2 ? activeDot.Get() : inactiveDot.Get());
 
         target_->PopAxisAlignedClip();
     }
@@ -5228,6 +5444,62 @@ DWORD WINAPI KeyboardThreadProc(void*) {
     return 0;
 }
 
+struct AgentInputControls { HWND window = nullptr; HWND agent = nullptr; HWND project = nullptr; HWND prompt = nullptr; };
+AgentInputControls g_agentInput;
+
+std::string BridgeWideToUtf8(const std::wstring& value) {
+    if (value.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), out.data(), n, nullptr, nullptr);
+    return out;
+}
+std::string BridgeJsonEscape(const std::wstring& value) {
+    std::string out;
+    for (wchar_t c : value) { if (c == L'"' || c == L'\\') out += '\\'; if (c == L'\n') out += "\\n"; else out += BridgeWideToUtf8(std::wstring(1, c)); }
+    return out;
+}
+void CloseAgentInput(HWND hwnd) { DestroyWindow(hwnd); g_agentInput = {}; PostMessageW(g_hwnd, WM_APP_LAYOUT_CHANGED, 0, 0); }
+LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            g_agentInput.window = hwnd;
+            CreateWindowW(L"STATIC", L"Agent", WS_CHILD | WS_VISIBLE, 16, 14, 70, 22, hwnd, nullptr, nullptr, nullptr);
+            g_agentInput.agent = CreateWindowW(L"COMBOBOX", L"Claude Code", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 88, 10, 190, 180, hwnd, reinterpret_cast<HMENU>(101), nullptr, nullptr);
+            SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Claude Code")); SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Codex")); SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Gemini")); SendMessageW(g_agentInput.agent, CB_SETCURSEL, 0, 0);
+            CreateWindowW(L"STATIC", L"Project folder", WS_CHILD | WS_VISIBLE, 16, 50, 100, 22, hwnd, nullptr, nullptr, nullptr);
+            g_agentInput.project = CreateWindowW(L"EDIT", L"C:\\", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 116, 46, 330, 26, hwnd, reinterpret_cast<HMENU>(102), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Browse", WS_CHILD | WS_VISIBLE, 452, 46, 78, 26, hwnd, reinterpret_cast<HMENU>(103), nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"Prompt", WS_CHILD | WS_VISIBLE, 16, 86, 80, 22, hwnd, nullptr, nullptr, nullptr);
+            g_agentInput.prompt = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL, 16, 112, 514, 150, hwnd, reinterpret_cast<HMENU>(104), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Run agent", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 342, 278, 92, 30, hwnd, reinterpret_cast<HMENU>(105), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE, 438, 278, 92, 30, hwnd, reinterpret_cast<HMENU>(106), nullptr, nullptr);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == 103) {
+                BROWSEINFOW bi = {}; bi.hwndOwner = hwnd; bi.lpszTitle = L"Choose an agent project folder"; bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+                PIDLIST_ABSOLUTE id = SHBrowseForFolderW(&bi); if (id) { wchar_t path[MAX_PATH] = {}; SHGetPathFromIDListW(id, path); SetWindowTextW(g_agentInput.project, path); CoTaskMemFree(id); } return 0;
+            }
+            if (LOWORD(wParam) == 106) { CloseAgentInput(hwnd); return 0; }
+            if (LOWORD(wParam) == 105) {
+                wchar_t project[MAX_PATH] = {}, prompt[32768] = {}; GetWindowTextW(g_agentInput.project, project, ARRAYSIZE(project)); GetWindowTextW(g_agentInput.prompt, prompt, ARRAYSIZE(prompt));
+                int index = static_cast<int>(SendMessageW(g_agentInput.agent, CB_GETCURSEL, 0, 0)); const char* names[] = {"claude", "codex", "gemini"};
+                if (index >= 0 && index < 3 && project[0] && prompt[0]) { std::string request = "{\"op\":\"agent.start\",\"agent\":\"" + std::string(names[index]) + "\",\"project\":\"" + BridgeJsonEscape(project) + "\",\"prompt\":\"" + BridgeJsonEscape(prompt) + "\"}"; { std::lock_guard lock(g_stateMutex); g_state.bridge.activeAgent = index; g_state.bridge.agentOutput.clear(); g_state.bridge.agentStatus = L"Starting"; } QueueBridgeRequest(std::move(request)); CloseAgentInput(hwnd); } return 0;
+            }
+            return 0;
+        case WM_CLOSE: CloseAgentInput(hwnd); return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+DWORD WINAPI AgentInputThreadProc(void*) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    static const wchar_t kClass[] = L"DynamicIsland.AgentInput"; WNDCLASSW wc = {}; wc.lpfnWndProc = AgentInputWndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = kClass; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); RegisterClassW(&wc);
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kClass, L"Run local AI agent", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 560, 360, nullptr, nullptr, wc.hInstance, nullptr); ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd);
+    MSG msg; while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); } UnregisterClassW(kClass, wc.hInstance); if (SUCCEEDED(hr)) CoUninitialize(); return 0;
+}
+void ShowAgentInput() { CreateThread(nullptr, 0, AgentInputThreadProc, nullptr, 0, nullptr); }
+
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
@@ -5434,8 +5706,13 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                 } else {
                     if (!kinds.empty() && kinds[0] == IslandKind::Idle && height > 45.0f) {
-                        if (xPos < width / 2.0f) g_idleTab = (g_idleTab - 1 + 2) % 2;
-                        else g_idleTab = (g_idleTab + 1) % 2;
+                        if ((g_idleTab % 3) == 1) {
+                            ShowAgentInput();
+                        } else if (xPos < width / 2.0f) {
+                            g_idleTab = (g_idleTab - 1 + 3) % 3;
+                        } else {
+                            g_idleTab = (g_idleTab + 1) % 3;
+                        }
                         g_layoutDirty = true;
                     } else {
                         HandleStatusClickAtPoint(hwnd, lParam);
@@ -5885,6 +6162,8 @@ bool StartThreads() {
     }
 
     g_running = true;
+    g_bridgeStop = false;
+    g_bridgeThread = CreateThread(nullptr, 0, BridgeThreadProc, nullptr, 0, nullptr);
     g_renderThread = CreateThread(nullptr, 0, RenderThreadProc, nullptr, 0, nullptr);
     if (!g_renderThread) {
         return false;
@@ -5908,8 +6187,9 @@ void StopThreads() {
     if (g_stopEvent) {
         SetEvent(g_stopEvent);
     }
+    g_bridgeStop = true;
 
-    HANDLE handles[] = {g_renderThread, g_mediaThread, g_audioThread, g_weatherThread, g_notificationThread, g_keyboardThread};
+    HANDLE handles[] = {g_renderThread, g_mediaThread, g_audioThread, g_weatherThread, g_notificationThread, g_keyboardThread, g_bridgeThread};
     for (HANDLE handle : handles) {
         if (handle) {
             WaitForSingleObject(handle, 3000);
@@ -5922,6 +6202,7 @@ void StopThreads() {
     g_audioThread = nullptr;
     g_weatherThread = nullptr;
     g_notificationThread = nullptr;
+    g_bridgeThread = nullptr;
     g_keyboardThread = nullptr;
     g_keyboardThreadId = 0;
 
