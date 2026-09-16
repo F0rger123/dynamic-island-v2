@@ -48,7 +48,7 @@ internal static class Program
         while ((line = await reader.ReadLineAsync()) is not null)
         {
             if (line.Length > 64 * 1024) { await Send(writer, new { ok = false, error = "message_too_large" }); continue; }
-            try { await Dispatch(JsonDocument.Parse(line).RootElement, writer); }
+            try { using var document = JsonDocument.Parse(line); await Dispatch(document.RootElement, writer); }
             catch (JsonException) { await Send(writer, new { ok = false, error = "invalid_json" }); }
             catch (Exception e) { await Send(writer, new { ok = false, error = "request_failed", detail = e.Message }); }
         }
@@ -178,8 +178,8 @@ internal static class Program
         static string StartValue(JsonElement item, string key)
         {
             if (!item.TryGetProperty(key, out var value)) return "";
-            if (value.TryGetProperty("dateTime", out var dateTime)) return dateTime.GetString() ?? "";
-            if (value.TryGetProperty("date", out var date)) return date.GetString() ?? "";
+            if (value.ValueKind == JsonValueKind.Object && value.TryGetProperty("dateTime", out var dateTime)) return dateTime.GetString() ?? "";
+            if (value.ValueKind == JsonValueKind.Object && value.TryGetProperty("date", out var date)) return date.GetString() ?? "";
             return value.ToString();
         }
         public static async Task<object[]> Today()

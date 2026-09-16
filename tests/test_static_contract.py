@@ -6,7 +6,8 @@ bridge = (root / "bridge" / "Program.cs").read_text()
 readme = (root / "README.md").read_text()
 
 # Regression checks for the requested contracts that can run on Linux.
-assert "int y = work.top + 1;" in source
+assert "kRenderPadY) + 1" in source
+assert "artChangedAt" in source and "recentArtChange" not in source
 assert "GetMonitorDpiScale(next.targetMonitor)" in source
 assert "WaitForSingleObject(g_stopEvent, 16);" not in source
 assert "DwmFlush()" in source and "WaitForSingleObject(g_stopEvent, 100)" in source

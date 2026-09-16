@@ -86,6 +86,7 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -759,7 +760,7 @@ BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM dwData) {
     return TRUE;
 }
 
-RECT GetAnchorWorkRect() {
+RECT GetAnchorRect(bool physicalMonitor) {
     HMONITOR selectedMonitor = nullptr;
 
     if (g_settings.targetMonitor == -1) {
@@ -783,25 +784,29 @@ RECT GetAnchorWorkRect() {
 
     MONITORINFO mi = {sizeof(mi)};
     GetMonitorInfoW(selectedMonitor, &mi);
-    return mi.rcWork;
+    return physicalMonitor ? mi.rcMonitor : mi.rcWork;
 }
+
+RECT GetAnchorWorkRect() { return GetAnchorRect(false); }
+RECT GetAnchorMonitorRect() { return GetAnchorRect(true); }
 
 void PositionOverlayWindow(HWND hwnd, int width, int height) {
     RECT work = GetAnchorWorkRect();
-    int x = work.left + (work.right - work.left - width) / 2;
-    // The work-area origin is already the selected display's top edge. Keep the
-    // collapsed glass visually flush with the display (the 1 px inset avoids
-    // clipping the anti-aliased top highlight on some DWM configurations).
-    int y = work.top + 1;
+    RECT monitor = GetAnchorMonitorRect();
+    int x = monitor.left + (monitor.right - monitor.left - width) / 2;
+    // Position the D2D render padding above the glass so the visible pill is
+    // flush with the selected physical display edge (the 1 px inset avoids
+    // clipping its anti-aliased top highlight).
+    int y = monitor.top - static_cast<int>(kRenderPadY) + 1;
 
     switch (g_settings.position) {
         case Position::TopLeft:
-            x = work.left + 16;
-            y = work.top + 1;
+            x = monitor.left + 16;
+            y = monitor.top - static_cast<int>(kRenderPadY) + 1;
             break;
         case Position::TopRight:
-            x = work.right - width - 16;
-            y = work.top + 1;
+            x = monitor.right - width - 16;
+            y = monitor.top - static_cast<int>(kRenderPadY) + 1;
             break;
         case Position::BottomCenter:
             x = work.left + (work.right - work.left - width) / 2;
@@ -1581,10 +1586,7 @@ DWORD WINAPI MediaThreadProc(void*) {
 
         {
             std::lock_guard lock(g_stateMutex);
-            const bool wasDifferent =
-                next.playing != g_state.media.playing ||
-                next.title != g_state.media.title ||
-                next.artist != g_state.media.artist;
+            const bool playbackChanged = next.playing != g_state.media.playing;
 
             if (!g_state.media.art.bgra.empty() &&
                 next.title == g_state.media.title && next.artist == g_state.media.artist) {
@@ -1599,9 +1601,9 @@ DWORD WINAPI MediaThreadProc(void*) {
             }
 
             g_state.media = std::move(next);
-            if (wasDifferent && g_state.media.available) {
-                TriggerNudge();
-            }
+            // A play/pause action may nudge the pill; a new song must remain
+            // visually quiet when the user is not interacting with media.
+            if (playbackChanged && g_state.media.available) TriggerNudge();
         }
 
         WaitForSingleObject(g_stopEvent, 1500);
@@ -3823,8 +3825,10 @@ class Renderer {
         int tab = g_idleTab % 3;
         if (tab < 0) tab += 3;
 
-        if (tab == 0) DrawBridgeCalendarDashboard(state, rect, scale);
-        else if (tab == 1) DrawAgentsDashboard(state, rect, scale);
+        const bool showCalendar = settings.calendar;
+        const bool showAgents = settings.agents;
+        if (tab == 0 && showCalendar) DrawBridgeCalendarDashboard(state, rect, scale);
+        else if (showAgents && ((showCalendar && tab == 1) || (!showCalendar && tab == 0))) DrawAgentsDashboard(state, rect, scale);
         else DrawWeatherDashboard(state, rect, settings, now, scale, hasWeather, wIcon, wText);
 
         // Pagination dots (Vertical on the right edge)
@@ -5468,7 +5472,7 @@ std::string BridgeJsonEscape(const std::wstring& value) {
     for (wchar_t c : value) { if (c == L'"' || c == L'\\') out += '\\'; if (c == L'\n') out += "\\n"; else out += BridgeWideToUtf8(std::wstring(1, c)); }
     return out;
 }
-void CloseAgentInput(HWND hwnd) { DestroyWindow(hwnd); g_agentInput = {}; PostMessageW(g_hwnd, WM_APP_LAYOUT_CHANGED, 0, 0); }
+void CloseAgentInput(HWND hwnd) { if (hwnd) DestroyWindow(hwnd); g_agentInput = {}; if (g_hwnd) PostMessageW(g_hwnd, WM_APP_LAYOUT_CHANGED, 0, 0); }
 LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -5498,16 +5502,23 @@ LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             return 0;
         case WM_CLOSE: CloseAgentInput(hwnd); return 0;
+        case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 DWORD WINAPI AgentInputThreadProc(void*) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     static const wchar_t kClass[] = L"DynamicIsland.AgentInput"; WNDCLASSW wc = {}; wc.lpfnWndProc = AgentInputWndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = kClass; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); RegisterClassW(&wc);
-    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kClass, L"Run local AI agent", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 560, 360, nullptr, nullptr, wc.hInstance, nullptr); ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd);
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kClass, L"Run local AI agent", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 560, 360, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) { UnregisterClassW(kClass, wc.hInstance); if (SUCCEEDED(hr)) CoUninitialize(); return 0; }
+    ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd);
     MSG msg; while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); } UnregisterClassW(kClass, wc.hInstance); if (SUCCEEDED(hr)) CoUninitialize(); return 0;
 }
-void ShowAgentInput() { CreateThread(nullptr, 0, AgentInputThreadProc, nullptr, 0, nullptr); }
+void ShowAgentInput() {
+    if (g_agentInput.window && IsWindow(g_agentInput.window)) { SetForegroundWindow(g_agentInput.window); return; }
+    HANDLE thread = CreateThread(nullptr, 0, AgentInputThreadProc, nullptr, 0, nullptr);
+    if (thread) CloseHandle(thread);
+}
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -5960,8 +5971,10 @@ DWORD WINAPI RenderThreadProc(void*) {
             primary.height = 64.0f * g_settings.sizeScale;
         }
         if (primary.kind == IslandKind::Media) {
-            bool recentArtChange = (NowSeconds() - g_state.media.artChangedAt) < 4.0;
-            if (isHoverExpanded || pinned || recentArtChange) {
+            // Track changes update artwork/title/waveform in place. They are not
+            // transient expansion events: only hover, pin, or an explicit click
+            // may expand media by default.
+            if (isHoverExpanded || pinned) {
                 primary.width = 380.0f * g_settings.sizeScale;
                 primary.height = 184.0f * g_settings.sizeScale;
             }

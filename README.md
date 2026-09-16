@@ -13,7 +13,7 @@ offline/auth-required state.
    enable it for `windhawk.exe`.
 3. In the mod settings select the monitor (`primary`, a 1-based monitor index,
    or `follow`), offsets, DPI scaling and modules. The top anchor is the
-   selected work-area top + 1 logical pixel; `OffsetY` remains applied after
+   selected display top edge + 1 logical pixel (the render padding is placed above the glass); `OffsetY` remains applied after
    monitor selection.
 
 The source requires the Windows SDK/Windows App SDK headers already supplied by

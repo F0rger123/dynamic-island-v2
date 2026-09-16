@@ -4,4 +4,8 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier><ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable><InvariantGlobalization>false</InvariantGlobalization>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.IO.Pipes.AccessControl" Version="8.0.0" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
 </Project>
