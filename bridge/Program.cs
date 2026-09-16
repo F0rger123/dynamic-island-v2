@@ -63,8 +63,9 @@ internal static class Program
 
     // Agent streams and the request/response loop share this writer; serialize
     // writes so each JSON line reaches the pipe intact even while an agent is
-    // streaming and new requests arrive.
-    static readonly object WriteLock = new();
+    // streaming and new requests arrive. (SemaphoreSlim because C# forbids
+    // await inside a lock statement.)
+    static readonly SemaphoreSlim WriteSemaphore = new(1, 1);
 
     static async Task Dispatch(JsonElement r, StreamWriter w)
     {
@@ -144,11 +145,11 @@ internal static class Program
         if (agent == "gemini" && provider == "api")
         {
             if (!GeminiApi.HasKey()) throw new InvalidDataException("gemini_api_key_required");
-            var id = Guid.NewGuid().ToString("N");
+            var apiId = Guid.NewGuid().ToString("N");
             var cts = new CancellationTokenSource();
-            lock (JobsLock) ApiJobs[id] = cts;
-            await Send(w, new { ok = true, id, agent, project = root, provider = "api" });
-            _ = RunGeminiApiJob(id, root, prompt, w, cts);
+            lock (JobsLock) ApiJobs[apiId] = cts;
+            await Send(w, new { ok = true, id = apiId, agent, project = root, provider = "api" });
+            _ = RunGeminiApiJob(apiId, root, prompt, w, cts);
             return;
         }
         if (provider is not null) throw new InvalidDataException("provider_not_supported");
@@ -285,9 +286,14 @@ internal static class Program
     static async Task Send(StreamWriter w, object value)
     {
         var line = JsonSerializer.Serialize(value, JsonOptions);
-        lock (WriteLock)
+        await WriteSemaphore.WaitAsync().ConfigureAwait(false);
+        try
         {
             await w.WriteLineAsync(line).ConfigureAwait(false);
+        }
+        finally
+        {
+            WriteSemaphore.Release();
         }
     }
 

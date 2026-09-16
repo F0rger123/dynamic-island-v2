@@ -157,9 +157,11 @@ internal sealed class SetupWizard : Form
             {
                 var b = Button(buttonText, (_, _) => AgentAction(index, buttonText));
                 b.Font = new Font("Segoe UI", 8.5f);
+                b.AutoSize = false;
+                b.Size = new Size(ProviderButtonWidth(buttonText), 30);
                 b.Location = new Point(x, y);
                 p.Controls.Add(b);
-                x += b.PreferredWidth + 6;
+                x += b.Width + 6;
             }
         }
         p.Controls.Add(new Label { Text = "Optional Gemini API mode (stored with Windows DPAPI) — lets Gemini work even when the CLI cannot log in:", AutoSize = true, Location = new Point(38, 252), Font = new Font("Segoe UI", 8.5f) });
@@ -175,6 +177,17 @@ internal sealed class SetupWizard : Form
     }
 
     // --- Provider row actions ------------------------------------------------
+
+    static int ProviderButtonWidth(string label) => label switch
+    {
+        "Test" => 44,
+        "Login" => 52,
+        "Rescan" => 62,
+        "Install" => 60,
+        "Use Gemini API" => 104,
+        "Locate manually" => 106,
+        _ => 80,
+    };
 
     void AgentAction(int index, string action)
     {
@@ -249,7 +262,7 @@ internal sealed class SetupWizard : Form
             else if (extension == ".ps1")
             {
                 psi = new ProcessStartInfo("powershell.exe") { UseShellExecute = true };
-                psi.ArgumentList.AddRange(new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path });
+                foreach (var a in new[] { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path }) psi.ArgumentList.Add(a);
             }
             else
             {

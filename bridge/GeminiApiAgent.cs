@@ -45,13 +45,6 @@ internal static class GeminiApiAgent
 
     public static async Task<string> Run(string id, string project, string prompt, StreamWriter writer, CancellationToken token)
     {
-        var key = SecretStore.LoadGemini();
-        if (string.IsNullOrWhiteSpace(key))
-        {
-            await Send(writer, id, "failed", "Gemini API key not saved. Open Setup & Integrations in the bridge and store a key.");
-            return "failed";
-        }
-
         using var localToken = CancellationTokenSource.CreateLinkedTokenSource(token);
         var t = localToken.Token;
         bool disconnected = false;
@@ -78,6 +71,13 @@ internal static class GeminiApiAgent
                 disconnected = true;
                 try { localToken.Cancel(); } catch { }
             }
+        }
+
+        var key = SecretStore.LoadGemini();
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            await Send("failed", "Gemini API key not saved. Open Setup & Integrations in the bridge and store a key.");
+            return "failed";
         }
 
         var history = new List<Dictionary<string, object?>>
