@@ -101,3 +101,42 @@ host UI.
 Final Windows verification still requires a Windows SDK/Windhawk build and
 real local CLI installations plus Google OAuth credentials. This environment is
 Linux, so those end-to-end steps cannot honestly be claimed as run here.
+
+## Easy setup and release packaging
+
+The bridge is now a Windows GUI executable (`WinExe`). On first launch it opens
+`Dynamic Island v2 Setup` automatically. It can also be reopened with:
+
+```powershell
+DynamicIslandBridge.exe --setup
+```
+
+The wizard provides:
+
+- Windows/.NET/Windhawk/CLI checks.
+- Claude, Codex, Gemini, and Git discovery in PATH and common Windows locations.
+- Copyable official install commands.
+- Official setup links opened directly in the browser.
+- Google Desktop OAuth JSON selection and DPAPI-protected client credentials.
+- Browser OAuth connection from the wizard.
+- Optional DPAPI-protected Gemini API-key storage.
+- Per-user Windows startup configuration.
+- Skip/setup-later behavior without blocking the base Dynamic Island.
+
+Build and package on Windows with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+The script restores dependencies, builds Release, runs the protocol/setup tests,
+and publishes `artifacts\DynamicIslandBridge`. `install.ps1` can copy that
+published bridge into the current user's LocalAppData and launch the wizard.
+There is also a Windows GitHub Actions workflow at
+`.github/workflows/windows-release.yml` that publishes a downloadable artifact
+for tags or manual runs.
+
+Google credentials selected by the wizard are stored with DPAPI under the
+current user's LocalAppData. Environment variables remain an advanced fallback,
+not the normal setup path. Diagnostic bridge requests contain paths/status only;
+secrets and prompts are not logged.

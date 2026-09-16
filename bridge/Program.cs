@@ -23,12 +23,15 @@ internal static class Program
     public static async Task Main()
     {
         Directory.CreateDirectory(DataDir);
+        if (Environment.GetCommandLineArgs().Any(a => string.Equals(a, "--setup", StringComparison.OrdinalIgnoreCase))) SetupState.ShowAgain(); else SetupState.ShowIfFirstRun();
         while (true)
         {
             try { await ServeClient(await CreatePipe()); }
             catch (Exception e) { Console.Error.WriteLine($"bridge: {e.Message}"); }
         }
     }
+
+    internal static Task<bool> ConnectGoogleCalendar() => Calendar.Auth();
 
     static async Task<NamedPipeServerStream> CreatePipe()
     {
@@ -55,19 +58,42 @@ internal static class Program
         pipe.Dispose();
     }
 
+    static void SafeLog(string message) { try { File.AppendAllText(Path.Combine(DataDir, "bridge.log"), DateTimeOffset.Now.ToString("O") + " " + message + Environment.NewLine); } catch { } }
+
     static async Task Dispatch(JsonElement r, StreamWriter w)
     {
         var op = r.TryGetProperty("op", out var o) ? o.GetString() : null;
+        SafeLog(op ?? "invalid");
         switch (op)
         {
-            case "status": await Send(w, new { ok = true, bridge = "online", agents = DetectAgents() }); break;
+            case "status": await Send(w, new { ok = true, bridge = "online", version = "2.0.0", agents = DetectAgents() }); break;
+            case "diagnostics": await Send(w, new { ok = true, bridge = "online", version = "2.0.0", runtime = Environment.Version.ToString(), claude = FindOrNull("claude"), codex = FindOrNull("codex"), gemini = FindOrNull("gemini"), git = FindOrNull("git"), setup = SetupState.IsComplete }); break;
             case "calendar.auth": await Send(w, new { ok = await Calendar.Auth(), state = "authorized" }); break;
             case "calendar.today": await Send(w, new { ok = true, events = await Calendar.Today() }); break;
+            case "gemini.api.test": await Send(w, new { ok = await TestGeminiApi(), provider = "gemini-api" }); break;
             case "agent.start": await StartAgent(r, w); break;
             case "agent.cancel": await Cancel(r, w); break;
             case "agent.resume": await ResumeAgent(r, w); break;
             default: await Send(w, new { ok = false, error = "unknown_operation" }); break;
         }
+    }
+
+    static string? FindOrNull(string name) { try { return CliDiscovery.Find(name); } catch { return null; } }
+
+    static async Task<bool> TestGeminiApi()
+    {
+        var key = SecretStore.LoadGemini(); if (string.IsNullOrWhiteSpace(key)) throw new InvalidOperationException("gemini_api_key_required");
+        using var http = new HttpClient(); using var body = new StringContent("{\"contents\":[{\"parts\":[{\"text\":\"Reply with READY only.\"}]}]}", Encoding.UTF8, "application/json");
+        using var response = await http.PostAsync("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + Uri.EscapeDataString(key), body); return response.IsSuccessStatusCode;
+    }
+
+    static ProcessStartInfo CreateStartInfo(string file, string root, IEnumerable<string> args)
+    {
+        var isBatch = file.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".bat", StringComparison.OrdinalIgnoreCase);
+        var psi = new ProcessStartInfo(isBatch ? Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe" : file) { WorkingDirectory = root, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+        if (isBatch) { psi.ArgumentList.Add("/d"); psi.ArgumentList.Add("/s"); psi.ArgumentList.Add("/c"); psi.ArgumentList.Add(file); }
+        foreach (var arg in args) psi.ArgumentList.Add(arg);
+        return psi;
     }
 
     static async Task StartAgent(JsonElement r, StreamWriter w)
@@ -77,8 +103,7 @@ internal static class Program
         var prompt = Required(r, "prompt");
         if (prompt.Length > 32_000) throw new InvalidDataException("prompt_too_large");
         var (file, args) = AgentCommand(agent, prompt);
-        var psi = new ProcessStartInfo(file) { WorkingDirectory = root, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
-        foreach (var arg in args) psi.ArgumentList.Add(arg);
+        var psi = CreateStartInfo(file, root, args);
         var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
         if (!p.Start()) throw new InvalidOperationException("agent_start_failed");
         var id = Guid.NewGuid().ToString("N"); lock (JobsLock) Jobs[id] = p;
@@ -127,7 +152,7 @@ internal static class Program
             "gemini" => new[] { "--resume", session, "-p", prompt, "--output-format", "stream-json" },
             _ => throw new InvalidDataException("unsupported_agent")
         };
-        var psi = new ProcessStartInfo(file) { WorkingDirectory = root, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true }; foreach (var arg in args) psi.ArgumentList.Add(arg);
+        var psi = CreateStartInfo(file, root, args);
         var process = new Process { StartInfo = psi }; if (!process.Start()) throw new InvalidOperationException("agent_resume_failed");
         var id = Guid.NewGuid().ToString("N"); lock (JobsLock) Jobs[id] = process; await Send(w, new { ok = true, id, agent, resumed = session }); _ = StreamOutput(id, process, w);
     }
@@ -143,7 +168,14 @@ internal static class Program
     static Dictionary<string, bool> DetectAgents() => new() { ["claude"] = Exists("claude"), ["codex"] = Exists("codex"), ["gemini"] = Exists("gemini") };
     static bool Exists(string n) { try { Find(n); return true; } catch { return false; } }
     static string Find(string n)
-    { foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator)) foreach (var ext in new[] { ".exe", ".cmd", ".bat", "" }) { var p = Path.Combine(dir, n + ext); if (File.Exists(p)) return p; } throw new FileNotFoundException($"{n}_not_found"); }
+    {
+        var dirs = new List<string>((Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries));
+        dirs.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".npm-global"));
+        dirs.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "npm"));
+        dirs.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs"));
+        foreach (var dir in dirs.Distinct(StringComparer.OrdinalIgnoreCase)) foreach (var ext in new[] { ".exe", ".cmd", ".bat", "" }) { var p = Path.Combine(dir, n + ext); if (File.Exists(p)) return p; }
+        throw new FileNotFoundException($"{n}_not_found");
+    }
     static string Required(JsonElement r, string n) => r.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(v.GetString()) ? v.GetString()! : throw new InvalidDataException($"missing_{n}");
     static string FullDirectory(string value) { var p = Path.GetFullPath(value); if (!Directory.Exists(p) || p.StartsWith("\\\\")) throw new InvalidDataException("invalid_project_directory"); return p; }
     static Task Send(StreamWriter w, object value) => w.WriteLineAsync(JsonSerializer.Serialize(value, JsonOptions));
@@ -155,8 +187,12 @@ internal static class Program
         static Token? Load() { if (!File.Exists(TokenFile)) return null; try { var b = ProtectedData.Unprotect(File.ReadAllBytes(TokenFile), null, DataProtectionScope.CurrentUser); return JsonSerializer.Deserialize<Token>(b); } catch { return null; } }
         public static async Task<bool> Auth()
         {
-            var client = Environment.GetEnvironmentVariable("DYNAMIC_ISLAND_GOOGLE_CLIENT_ID"); var secret = Environment.GetEnvironmentVariable("DYNAMIC_ISLAND_GOOGLE_CLIENT_SECRET");
-            if (string.IsNullOrWhiteSpace(client) || string.IsNullOrWhiteSpace(secret)) throw new InvalidOperationException("set_google_oauth_environment_variables");
+            var saved = CredentialStore.LoadGoogle();
+            var client = Environment.GetEnvironmentVariable("DYNAMIC_ISLAND_GOOGLE_CLIENT_ID");
+            var secret = Environment.GetEnvironmentVariable("DYNAMIC_ISLAND_GOOGLE_CLIENT_SECRET");
+            if (string.IsNullOrWhiteSpace(client)) client = saved?.ClientId;
+            if (string.IsNullOrWhiteSpace(secret)) secret = saved?.ClientSecret;
+            if (string.IsNullOrWhiteSpace(client) || string.IsNullOrWhiteSpace(secret)) throw new InvalidOperationException("google_credentials_required_open_setup");
             using var listener = new HttpListener(); listener.Prefixes.Add("http://127.0.0.1:43871/"); listener.Start();
             var uri = $"https://accounts.google.com/o/oauth2/v2/auth?client_id={Uri.EscapeDataString(client)}&redirect_uri=http%3A%2F%2F127.0.0.1%3A43871%2F&response_type=code&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar.readonly&access_type=offline&prompt=consent";
             Process.Start(new ProcessStartInfo(uri) { UseShellExecute = true }); var ctx = await listener.GetContextAsync(); var code = ctx.Request.QueryString["code"]; await using (var s = new StreamWriter(ctx.Response.OutputStream)) await s.WriteAsync("Authorization complete. You can close this tab."); ctx.Response.Close(); if (string.IsNullOrEmpty(code)) return false;
@@ -166,8 +202,11 @@ internal static class Program
         {
             var t = Load(); if (t is null) throw new InvalidOperationException("calendar_auth_required");
             if (t.expires_at > DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 60) return t.access_token;
+            var saved = CredentialStore.LoadGoogle();
             var client = Environment.GetEnvironmentVariable("DYNAMIC_ISLAND_GOOGLE_CLIENT_ID");
             var secret = Environment.GetEnvironmentVariable("DYNAMIC_ISLAND_GOOGLE_CLIENT_SECRET");
+            if (string.IsNullOrWhiteSpace(client)) client = saved?.ClientId;
+            if (string.IsNullOrWhiteSpace(secret)) secret = saved?.ClientSecret;
             if (string.IsNullOrWhiteSpace(client) || string.IsNullOrWhiteSpace(secret)) throw new InvalidOperationException("google_oauth_configuration_missing");
             using var http = new HttpClient();
             var form = new FormUrlEncodedContent(new Dictionary<string,string> { ["client_id"] = client, ["client_secret"] = secret, ["refresh_token"] = t.refresh_token, ["grant_type"] = "refresh_token" });
