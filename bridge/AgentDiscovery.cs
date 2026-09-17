@@ -105,6 +105,13 @@ internal static class CliDiscovery
         dirs.Add(Path.Combine(profile, "AppData", "Roaming", "npm"));
         dirs.Add(Path.Combine(profile, ".npm-global"));
         dirs.Add(Path.Combine(localAppData, "Programs"));
+        // Antigravity CLI (agy): official Windows install location is
+        // %LOCALAPPDATA%\agy\bin\agy.exe (antigravity.google/docs/cli/install).
+        // Explicit probing here means a fresh install is found without waiting
+        // for the user PATH to refresh.
+        dirs.Add(Path.Combine(localAppData, "agy", "bin"));
+        dirs.Add(Path.Combine(localAppData, "Antigravity", "bin"));
+        dirs.Add(Path.Combine(localAppData, "Antigravity"));
         foreach (var npmDir in NpmGlobalDirs())
         {
             dirs.Add(npmDir);
@@ -363,12 +370,18 @@ internal static class AgentReadiness
         lock (CacheLock)
         {
             if (!force && Cache.TryGetValue(agent, out var hit) &&
-                DateTimeOffset.UtcNow - hit.At < (agent == "gemini" ? TimeSpan.FromSeconds(90) : TimeSpan.FromSeconds(45)))
+                DateTimeOffset.UtcNow - hit.At < (agent is "gemini" or "antigravity" or "google" ? TimeSpan.FromSeconds(90) : TimeSpan.FromSeconds(45)))
             {
                 return hit.Value;
             }
         }
-        var value = agent == "gemini" ? CheckGemini() : CheckCli(agent);
+        var value = agent switch
+        {
+            "gemini" => CheckCli("gemini"),        // legacy Gemini CLI
+            "antigravity" => CheckAntigravity(),   // current individual path
+            "google" => CheckGoogle(),             // aggregated Google slot
+            _ => CheckCli(agent),
+        };
         lock (CacheLock) Cache[agent] = (DateTimeOffset.UtcNow, value);
         return value;
     }
@@ -397,16 +410,42 @@ internal static class AgentReadiness
         return new AgentResult(Ready, path, "Ready" + (version.Length > 0 ? " \u00b7 " + version : ""), null);
     }
 
-    internal static AgentResult CheckGemini()
+    // Antigravity CLI (agy) is the current Google individual coding-agent path
+    // (Gemini CLI individual login is obsolete). Readiness runs real, harmless
+    // commands: `agy --version` (installed/healthy) and `agy models` (session
+    // valid; an unauthenticated session reports sign-in required).
+    internal static AgentResult CheckAntigravity()
     {
-        var cli = CheckCli("gemini");
-        if (cli.State == Ready) return new AgentResult(Ready, cli.Path, cli.Detail, "cli");
-        if (CheckApi(out var apiDetail) && apiDetail)
-        {
-            var detail = cli.State == NotFound ? "Ready \u00b7 Gemini API (CLI not installed)" : "Ready \u00b7 Gemini API";
-            return new AgentResult(Ready, cli.Path, detail, "api");
-        }
-        return cli;
+        var path = CliDiscovery.Find("agy");
+        if (path is null) return new AgentResult(NotFound, null, "Antigravity CLI not installed", "antigravity");
+        var version = ProcessLauncher.Run(path, new[] { "--version" }, 10000);
+        if (version is null || version.Value.Code != 0)
+            return new AgentResult(Error, path, "Error: could not run agy", "antigravity");
+        var versionLine = CliDiscovery.FirstLine(version.Value.Output);
+        var probe = ProcessLauncher.Run(path, new[] { "models" }, 15000);
+        if (probe is not null && probe.Value.Code == 0)
+            return new AgentResult(Ready, path, "Ready" + (versionLine.Length > 0 ? " \u00b7 " + versionLine : ""), "antigravity");
+        var probeText = probe is null ? "" : (probe.Value.Output + "\n" + probe.Value.Error).ToLowerInvariant();
+        if (LooksLikeAuthProblem(probeText))
+            return new AgentResult(AuthRequired, path, "Installed \u00b7 authentication required", "antigravity");
+        // `agy models` failed for another reason (no such command, network,
+        // ...): conservatively report that a sign-in may still be needed.
+        return new AgentResult(AuthRequired, path, "Installed \u00b7 run agy to sign in", "antigravity");
+    }
+
+    // Aggregated Google slot: Antigravity first, then the Gemini API fallback,
+    // then the legacy Gemini CLI (enterprise/Cloud Code Assist).
+    internal static AgentResult CheckGoogle()
+    {
+        var antigravity = CheckAntigravity();
+        if (antigravity.State == Ready) return antigravity;
+        if (CheckApi(out var apiOk) && apiOk)
+            return new AgentResult(Ready, antigravity.Path, "Ready \u00b7 Gemini API", "api");
+        var legacy = CheckCli("gemini");
+        if (legacy.State == Ready) return new AgentResult(Ready, legacy.Path, "Ready \u00b7 legacy Gemini CLI", "cli");
+        if (antigravity.State != NotFound) return antigravity;
+        if (legacy.State != NotFound) return legacy;
+        return antigravity; // not installed — Antigravity is the recommended path
     }
 
     // Cached (120 s) Gemini API key test. Returns ok and sets detail.

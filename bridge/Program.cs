@@ -76,14 +76,15 @@ internal static class Program
             case "status": await Send(w, StatusPayload()); break;
             case "diagnostics":
             {
-                var claude = AgentReadiness.Check("claude"); var codex = AgentReadiness.Check("codex"); var gemini = AgentReadiness.Check("gemini");
+                var claude = AgentReadiness.Check("claude"); var codex = AgentReadiness.Check("codex"); var google = AgentReadiness.Check("google");
                 await Send(w, new
                 {
                     ok = true, bridge = "online", version = "2.0.0", runtime = Environment.Version.ToString(),
                     claude = FindOrNull("claude"), codex = FindOrNull("codex"), gemini = FindOrNull("gemini"),
+                    antigravity = FindOrNull("agy"),
                     git = FindOrNull("git"), npm = FindOrNull("npm"), setup = SetupState.IsComplete,
-                    agent_state_claude = claude.State, agent_state_codex = codex.State, agent_state_gemini = gemini.State,
-                    agent_provider_gemini = gemini.Provider ?? "none",
+                    agent_state_claude = claude.State, agent_state_codex = codex.State, agent_state_gemini = google.State,
+                    agent_provider_gemini = google.Provider ?? "none",
                 });
                 break;
             }
@@ -105,12 +106,14 @@ internal static class Program
 
     // Per-agent readiness is reported to the island as flat keys
     // (agent_state_<agent>) so the C++ client can parse them without a JSON
-    // library. "ready" also covers the Gemini API fallback provider.
+    // library. The third slot is the aggregated Google provider: Antigravity
+    // CLI (current individual path), the Gemini API fallback, or the legacy
+    // Gemini CLI. agent_provider_gemini is "antigravity" | "api" | "cli" | "none".
     static Dictionary<string, object?> StatusPayload()
     {
         var claude = AgentReadiness.Check("claude");
         var codex = AgentReadiness.Check("codex");
-        var gemini = AgentReadiness.Check("gemini");
+        var google = AgentReadiness.Check("google");
         return new Dictionary<string, object?>
         {
             ["ok"] = true,
@@ -120,12 +123,12 @@ internal static class Program
             {
                 ["claude"] = claude.State != AgentReadiness.NotFound,
                 ["codex"] = codex.State != AgentReadiness.NotFound,
-                ["gemini"] = gemini.State != AgentReadiness.NotFound,
+                ["gemini"] = google.State != AgentReadiness.NotFound,
             },
             ["agent_state_claude"] = claude.State,
             ["agent_state_codex"] = codex.State,
-            ["agent_state_gemini"] = gemini.State,
-            ["agent_provider_gemini"] = gemini.Provider ?? "none",
+            ["agent_state_gemini"] = google.State,
+            ["agent_provider_gemini"] = google.Provider ?? "none",
         };
     }
 
@@ -153,7 +156,7 @@ internal static class Program
             return;
         }
         if (provider is not null) throw new InvalidDataException("provider_not_supported");
-        if (agent is not ("claude" or "codex" or "gemini")) throw new InvalidDataException("unsupported_agent");
+        if (agent is not ("claude" or "codex" or "gemini" or "antigravity")) throw new InvalidDataException("unsupported_agent");
 
         var (file, args) = AgentCommand(agent, prompt);
         var psi = CreateStartInfo(file, root, args);
@@ -264,6 +267,7 @@ internal static class Program
             "claude" => new[] { "-p", prompt, "--resume", session, "--output-format", "stream-json", "--verbose" },
             "codex" => new[] { "exec", "resume", session, prompt, "--json" },
             "gemini" => new[] { "--resume", session, "-p", prompt, "--output-format", "stream-json" },
+            "antigravity" => new[] { "--output-format", "stream-json", "--conversation", session, "-p", prompt },
             _ => throw new InvalidDataException("unsupported_agent")
         };
         var psi = CreateStartInfo(file, root, args);
@@ -276,6 +280,12 @@ internal static class Program
         "claude" => (Find("claude"), new[] { "-p", prompt, "--output-format", "stream-json", "--verbose" }),
         "codex" => (Find("codex"), new[] { "exec", "--json", prompt }),
         "gemini" => (Find("gemini"), new[] { "-p", prompt, "--output-format", "stream-json" }),
+        // Antigravity CLI headless mode (antigravity.google/docs/cli/headless):
+        // agy -p <prompt> runs once and exits. The prompt value comes last.
+        // Headless runs cannot show approval prompts, so tool calls are
+        // auto-approved for this explicit agent run, and --print-timeout
+        // bounds the wait (agy's own default is 5m).
+        "antigravity" => (Find("agy"), new[] { "--output-format", "stream-json", "--print-timeout", "10m", "--dangerously-skip-permissions", "-p", prompt }),
         _ => throw new InvalidDataException("unsupported_agent")
     };
 

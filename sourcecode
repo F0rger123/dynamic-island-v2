@@ -318,7 +318,10 @@ struct BridgeSnapshot {
     // 0 = not installed, 1 = installed (authentication required),
     // 2 = ready, 3 = error.
     std::array<int, 3> agentsState{ 0, 0, 0 };
-    bool geminiApiProvider = false;   // Gemini reports ready via the Gemini API
+    // Google slot provider (slot 2): 0 = none, 1 = Antigravity CLI (agy),
+    // 2 = Gemini API, 3 = legacy Gemini CLI. Antigravity is the current
+    // individual-user path; the Gemini CLI login is obsolete for individuals.
+    int googleProvider = 0;
     bool geminiLoginUnavailable = false;
     int activeAgent = -1; // 0 Claude, 1 Codex, 2 Gemini
     bool agentRunning = false;
@@ -465,7 +468,7 @@ void ApplyBridgeMessage(const std::string& json) {
     if (BridgeJsonHas(json, "\"bridge\":\"online\"")) b.online = true;
     if (BridgeJsonHas(json, "\"ok\":true") && json.find("\"id\":") != std::string::npos && json.find("\"agent\":") != std::string::npos) {
         b.agentJobId = BridgeJsonString(json, "id"); b.agentRunning = true;
-        const std::wstring agent = BridgeJsonString(json, "agent"); b.activeAgent = agent == L"codex" ? 1 : (agent == L"gemini" ? 2 : 0); b.agentStatus = L"Running";
+        const std::wstring agent = BridgeJsonString(json, "agent"); b.activeAgent = agent == L"codex" ? 1 : (agent == L"gemini" || agent == L"antigravity" ? 2 : 0); b.agentStatus = L"Running";
         b.geminiLoginUnavailable = false; // a fresh run clears the previous hint
     }
     if (BridgeJsonHas(json, "calendar_auth_required") || BridgeJsonHas(json, "google_oauth")) {
@@ -490,7 +493,8 @@ void ApplyBridgeMessage(const std::string& json) {
         b.agentsState[0] = BridgeAgentStateFromName(BridgeJsonString(json, "agent_state_claude"));
         b.agentsState[1] = BridgeAgentStateFromName(BridgeJsonString(json, "agent_state_codex"));
         b.agentsState[2] = BridgeAgentStateFromName(BridgeJsonString(json, "agent_state_gemini"));
-        b.geminiApiProvider = json.find("\"agent_provider_gemini\":\"api\"") != std::string::npos;
+        const std::wstring google = BridgeJsonString(json, "agent_provider_gemini");
+        b.googleProvider = google == L"antigravity" ? 1 : (google == L"api" ? 2 : (google == L"cli" ? 3 : 0));
     }
     if (json.find("\"type\":\"agent\"") != std::string::npos) {
         b.agentRunning = true;
@@ -613,6 +617,19 @@ D2D1_COLOR_F ColorFromHex(std::wstring text, D2D1_COLOR_F fallback) {
         1.0f);
 }
 
+struct MonitorEnumData {
+    std::vector<HMONITOR> monitors;
+};
+
+// EnumDisplayMonitors needs a MONITORENUMPROC with the Windows CALLBACK
+// (__stdcall) calling convention. Windhawk/MinGW rejects a C++ lambda here,
+// so use a named CALLBACK function instead of an inline lambda.
+BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM dwData) {
+    auto* data = reinterpret_cast<MonitorEnumData*>(dwData);
+    data->monitors.push_back(hMonitor);
+    return TRUE;
+}
+
 // Returns the effective DPI for the selected monitor (1.0 = 96 DPI).
 float GetMonitorDpiScale(int targetMonitor) {
     HMONITOR monitor = nullptr;
@@ -621,12 +638,10 @@ float GetMonitorDpiScale(int targetMonitor) {
         GetCursorPos(&pt);
         monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     } else if (targetMonitor > 0) {
-        struct Monitors { std::vector<HMONITOR> values; } data;
-        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR h, HDC, LPRECT, LPARAM p) {
-            reinterpret_cast<Monitors*>(p)->values.push_back(h); return TRUE;
-        }, reinterpret_cast<LPARAM>(&data));
+        MonitorEnumData data;
+        EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(&data));
         const int index = targetMonitor - 1;
-        if (index >= 0 && index < static_cast<int>(data.values.size())) monitor = data.values[index];
+        if (index >= 0 && index < static_cast<int>(data.monitors.size())) monitor = data.monitors[index];
     }
     if (!monitor) {
         POINT pt = {0, 0};
@@ -789,16 +804,6 @@ void EnableBlurBehind(HWND hwnd) {
 }
 
 
-
-struct MonitorEnumData {
-    std::vector<HMONITOR> monitors;
-};
-
-BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM dwData) {
-    auto* data = reinterpret_cast<MonitorEnumData*>(dwData);
-    data->monitors.push_back(hMonitor);
-    return TRUE;
-}
 
 RECT GetAnchorRect(bool physicalMonitor) {
     HMONITOR selectedMonitor = nullptr;
@@ -2833,7 +2838,7 @@ void DismissTransientState() {
     Wh_SetIntValue(L"ProgressPercent", -1);
 }
 
-void ShowAgentInput(int prefAgent = -1, bool prefApi = false);
+void ShowAgentInput(int prefAgent = -1, int prefProvider = -1);
 std::string BridgeJsonEscape(const std::wstring& value);
 
 void ShowContextMenu(HWND hwnd, POINT screenPoint) {
@@ -2861,6 +2866,7 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
     AppendMenuW(menu, MF_STRING, 32, L"Stop running agent");
     AppendMenuW(menu, MF_STRING, 33, L"Use Gemini API Instead");
     AppendMenuW(menu, MF_STRING, 34, L"Open Google AI Studio");
+    AppendMenuW(menu, MF_STRING, 35, L"Use Antigravity Instead");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     // Color theme presets
     AppendMenuW(menu, MF_STRING, 20, L"Theme: OLED Black (default)");
@@ -2890,11 +2896,15 @@ void ShowContextMenu(HWND hwnd, POINT screenPoint) {
             break;
         }
         case 33:
-            // Open the agent input with Gemini preselected on the API provider.
-            ShowAgentInput(2, true);
+            // Open the agent input with the Google slot preselected on the Gemini API.
+            ShowAgentInput(2, 1);
             break;
         case 34:
             ShellExecuteW(nullptr, L"open", L"https://aistudio.google.com/apikey", nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case 35:
+            // Open the agent input with the Google slot preselected on Antigravity.
+            ShowAgentInput(2, 0);
             break;
         case 1:
             DismissTransientState();
@@ -3603,7 +3613,7 @@ class Renderer {
     void DrawAgentsDashboard(const SharedState& state, D2D1_RECT_F rect, float scale) {
         const auto& b = state.bridge;
         target_->DrawTextW(L"AI AGENTS", 9, boldTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.top + 14 * scale, rect.right - 20 * scale, rect.top + 36 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
-        const wchar_t* names[] = {L"C  Claude Code", L"X  Codex", L"G  Gemini"};
+        const wchar_t* names[] = {L"C  Claude Code", L"X  Codex", L"G  Google"};
         for (int i = 0; i < 3; ++i) {
             const float y = rect.top + (48 + i * 27) * scale;
             const bool selected = b.activeAgent == i;
@@ -3611,17 +3621,21 @@ class Renderer {
             const int agentState = b.agentsState[i];
             if (selected) target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(rect.left + 16 * scale, y - 3 * scale, rect.right - 16 * scale, y + 21 * scale), 8 * scale, 8 * scale), tintBrush_.Get());
             target_->DrawTextW(names[i], static_cast<UINT32>(wcslen(names[i])), textFormat_.Get(), D2D1::RectF(rect.left + 24 * scale, y, rect.left + 180 * scale, y + 20 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            const wchar_t* googleText =
+                b.googleProvider == 1 ? L"ready · antigravity" :
+                b.googleProvider == 2 ? L"ready · gemini api" :
+                b.googleProvider == 3 ? L"ready · legacy cli" : L"ready";
             const wchar_t* stateText =
                 (b.agentRunning && selected) ? L"running" :
-                (agentState == 2) ? (i == 2 && b.geminiApiProvider ? L"ready · api" : L"ready") :
+                (agentState == 2) ? (i == 2 ? googleText : L"ready") :
                 (agentState == 1) ? L"auth required" :
                 (agentState == 3) ? L"error" :
                 (available ? L"ready" : L"not installed");
-            target_->DrawTextW(stateText, static_cast<UINT32>(wcslen(stateText)), smallTextFormat_.Get(), D2D1::RectF(rect.right - 108 * scale, y + 2 * scale, rect.right - 22 * scale, y + 20 * scale), (available || agentState == 2) ? accentBrush_.Get() : mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            target_->DrawTextW(stateText, static_cast<UINT32>(wcslen(stateText)), smallTextFormat_.Get(), D2D1::RectF(rect.right - 128 * scale, y + 2 * scale, rect.right - 22 * scale, y + 20 * scale), (available || agentState == 2) ? accentBrush_.Get() : mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
         }
         if (b.geminiLoginUnavailable) {
-            target_->DrawTextW(L"Gemini CLI login unavailable for this account.", 43, smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.bottom - 46 * scale, rect.right - 22 * scale, rect.bottom - 28 * scale), accentBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            target_->DrawTextW(L"Use Gemini API Instead · right-click the island.", 43, smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.bottom - 28 * scale, rect.right - 22 * scale, rect.bottom - 10 * scale), accentBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            target_->DrawTextW(L"Gemini CLI individual login is no longer supported.", 51, smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.bottom - 46 * scale, rect.right - 22 * scale, rect.bottom - 28 * scale), accentBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            target_->DrawTextW(L"Use Google Antigravity or the Gemini API instead.", 48, smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.bottom - 28 * scale, rect.right - 22 * scale, rect.bottom - 10 * scale), accentBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
             return;
         }
         std::wstring status = b.online ? (b.agentStatus.empty() ? L"Select an agent · click to launch" : b.agentStatus) : L"Bridge offline";
@@ -5386,7 +5400,9 @@ DWORD WINAPI KeyboardThreadProc(void*) {
 struct AgentInputControls { HWND window = nullptr; HWND agent = nullptr; HWND provider = nullptr; HWND project = nullptr; HWND prompt = nullptr; };
 AgentInputControls g_agentInput;
 int g_agentInputPrefAgent = -1;
-bool g_agentInputPrefApi = false;
+// Google-slot provider preference: -1 = auto (bridge-ready provider),
+// 0 = Antigravity CLI, 1 = Gemini API, 2 = legacy Gemini CLI.
+int g_agentInputPrefProvider = -1;
 
 std::string BridgeWideToUtf8(const std::wstring& value) {
     if (value.empty()) return {};
@@ -5408,10 +5424,19 @@ void ApplyAgentInputProviderSelection(HWND hwnd) {
     EnableWindow(g_agentInput.provider, agentIndex == 2);
     if (agentIndex != 2) {
         SendMessageW(g_agentInput.provider, CB_SETCURSEL, 0, 0);
-    } else if (g_agentInputPrefApi) {
-        SendMessageW(g_agentInput.provider, CB_SETCURSEL, 1, 0);
-        g_agentInputPrefApi = false;
+        return;
     }
+    if (g_agentInputPrefProvider >= 0 && g_agentInputPrefProvider <= 2) {
+        SendMessageW(g_agentInput.provider, CB_SETCURSEL, g_agentInputPrefProvider, 0);
+        g_agentInputPrefProvider = -1;
+        return;
+    }
+    // Auto-select the provider the bridge currently reports as ready for the
+    // Google slot (Antigravity first, then Gemini API, then legacy CLI).
+    int googleProvider = 0;
+    { std::lock_guard lock(g_stateMutex); googleProvider = g_state.bridge.googleProvider; }
+    const int providerIndex = googleProvider == 2 ? 1 : (googleProvider == 3 ? 2 : 0);
+    SendMessageW(g_agentInput.provider, CB_SETCURSEL, providerIndex, 0);
 }
 LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -5419,10 +5444,10 @@ LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             g_agentInput.window = hwnd;
             CreateWindowW(L"STATIC", L"Agent", WS_CHILD | WS_VISIBLE, 16, 14, 70, 22, hwnd, nullptr, nullptr, nullptr);
             g_agentInput.agent = CreateWindowW(L"COMBOBOX", L"Claude Code", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 88, 10, 190, 180, hwnd, reinterpret_cast<HMENU>(101), nullptr, nullptr);
-            SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Claude Code")); SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Codex")); SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Gemini")); SendMessageW(g_agentInput.agent, CB_SETCURSEL, 0, 0);
+            SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Claude Code")); SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Codex")); SendMessageW(g_agentInput.agent, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Google (Antigravity / API)")); SendMessageW(g_agentInput.agent, CB_SETCURSEL, 0, 0);
             CreateWindowW(L"STATIC", L"Provider", WS_CHILD | WS_VISIBLE, 16, 44, 70, 22, hwnd, nullptr, nullptr, nullptr);
-            g_agentInput.provider = CreateWindowW(L"COMBOBOX", L"CLI (login)", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 88, 40, 190, 140, hwnd, reinterpret_cast<HMENU>(107), nullptr, nullptr);
-            SendMessageW(g_agentInput.provider, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"CLI (login)")); SendMessageW(g_agentInput.provider, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Gemini API")); SendMessageW(g_agentInput.provider, CB_SETCURSEL, 0, 0);
+            g_agentInput.provider = CreateWindowW(L"COMBOBOX", L"Antigravity CLI", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 88, 40, 190, 140, hwnd, reinterpret_cast<HMENU>(107), nullptr, nullptr);
+            SendMessageW(g_agentInput.provider, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Antigravity CLI")); SendMessageW(g_agentInput.provider, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Gemini API")); SendMessageW(g_agentInput.provider, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Gemini CLI (legacy)")); SendMessageW(g_agentInput.provider, CB_SETCURSEL, 0, 0);
             CreateWindowW(L"STATIC", L"Project folder", WS_CHILD | WS_VISIBLE, 16, 74, 100, 22, hwnd, nullptr, nullptr, nullptr);
             g_agentInput.project = CreateWindowW(L"EDIT", L"C:\\", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 116, 70, 330, 26, hwnd, reinterpret_cast<HMENU>(102), nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"Browse", WS_CHILD | WS_VISIBLE, 452, 70, 78, 26, hwnd, reinterpret_cast<HMENU>(103), nullptr, nullptr);
@@ -5451,12 +5476,20 @@ LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 wchar_t project[MAX_PATH] = {}, prompt[32768] = {}; GetWindowTextW(g_agentInput.project, project, ARRAYSIZE(project)); GetWindowTextW(g_agentInput.prompt, prompt, ARRAYSIZE(prompt));
                 int index = static_cast<int>(SendMessageW(g_agentInput.agent, CB_GETCURSEL, 0, 0));
                 int provider = (index == 2) ? static_cast<int>(SendMessageW(g_agentInput.provider, CB_GETCURSEL, 0, 0)) : 0;
-                const char* names[] = {"claude", "codex", "gemini"};
                 if (index >= 0 && index < 3 && project[0] && prompt[0]) {
-                    // agent.start format; Gemini API provider adds "provider":"api":
-                    // {"op":"agent.start","agent":"gemini","provider":"api","project":"...","prompt":"..."}
-                    std::string request = "{\"op\":\"agent.start\",\"agent\":\"" + std::string(names[index]);
-                    if (index == 2 && provider == 1) request += "\",\"provider\":\"api\"";
+                    // agent.start format. The Google slot (index 2) maps to:
+                    //   Antigravity CLI  -> {"op":"agent.start","agent":"antigravity",...}
+                    //   Gemini API       -> {"op":"agent.start","agent":"gemini","provider":"api",...}
+                    //   legacy Gemini CLI-> {"op":"agent.start","agent":"gemini",...}
+                    std::string request = "{\"op\":\"agent.start\",\"agent\":\"";
+                    if (index == 2) {
+                        if (provider == 1) request += "gemini\",\"provider\":\"api";
+                        else if (provider == 2) request += "gemini";
+                        else request += "antigravity";
+                    } else {
+                        const char* names[] = {"claude", "codex"};
+                        request += names[index];
+                    }
                     request += "\",\"project\":\"" + BridgeJsonEscape(project) + "\",\"prompt\":\"" + BridgeJsonEscape(prompt) + "\"}";
                     { std::lock_guard lock(g_stateMutex); g_state.bridge.activeAgent = index; g_state.bridge.agentOutput.clear(); g_state.bridge.agentStatus = L"Starting"; g_state.bridge.geminiLoginUnavailable = false; }
                     QueueBridgeRequest(std::move(request)); CloseAgentInput(hwnd);
@@ -5477,10 +5510,10 @@ DWORD WINAPI AgentInputThreadProc(void*) {
     ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd);
     MSG msg; while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); } UnregisterClassW(kClass, wc.hInstance); if (SUCCEEDED(hr)) CoUninitialize(); return 0;
 }
-void ShowAgentInput(int prefAgent, bool prefApi) {
+void ShowAgentInput(int prefAgent, int prefProvider) {
     if (g_agentInput.window && IsWindow(g_agentInput.window)) { SetForegroundWindow(g_agentInput.window); return; }
     g_agentInputPrefAgent = prefAgent;
-    g_agentInputPrefApi = prefApi;
+    g_agentInputPrefProvider = prefProvider;
     HANDLE thread = CreateThread(nullptr, 0, AgentInputThreadProc, nullptr, 0, nullptr);
     if (thread) CloseHandle(thread);
 }

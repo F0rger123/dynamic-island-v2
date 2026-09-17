@@ -22,13 +22,26 @@ assert "System.IO.Pipes.AccessControl" in project
 assert "System.Security.Cryptography.ProtectedData" in project
 
 # (9) Setup wizard provider rows: every provider gets its button set, asks
-# before installing, and auto-rescans after the npm install finishes.
-for label in ("Rescan", "Test", "Login", "Locate manually", "Install", "Use Gemini API"):
+# before installing, and auto-rescans after the install finishes.
+for label in ("Rescan", "Test", "Login", "Locate manually", "Install"):
     assert f'"{label}"' in wizard, label
 assert "@openai/codex" in wizard and "@google/gemini-cli" in wizard
 assert '"install", "-g", package' in wizard
 assert "MessageBox.Show" in wizard  # confirmation before installing software
 assert "RefreshAgentRow(index, force: true)" in wizard  # auto-rescan after install
+
+# (12) Antigravity: the recommended individual Google agent, installed with
+# the verified official one-liner and discovered at %LOCALAPPDATA%\agy\bin.
+assert "irm https://antigravity.google/cli/install.ps1 | iex" in wizard
+assert "antigravity" in wizard
+assert '"claude", "codex", "antigravity", "gemini"' in wizard  # row order
+assert "agy" in wizard and "agy" in discovery
+# The legacy Gemini CLI row is kept but clearly de-emphasized.
+assert "legacy" in wizard
+assert "Gemini CLI \\u2014 legacy (enterprise/Cloud)" in wizard
+assert "obsolete" in wizard.lower()
+# Login launches the discovered CLI (agy.exe for Antigravity) interactively.
+assert 'CliDiscovery.Find(agent == "antigravity" ? "agy" : agent)' in wizard
 
 # (1) Manual executable selection persisted per user and honored first.
 assert "SaveManualPath" in wizard and "cli-overrides.json" in discovery

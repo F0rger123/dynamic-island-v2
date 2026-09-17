@@ -68,6 +68,18 @@ def test_gemini_api_start_wire_format():
     assert request["project"] == "C:\\work"
 
 
+def test_antigravity_start_wire_format():
+    # Antigravity is a first-class agent with NO provider key (the provider
+    # key is only ever "api" for the Gemini API path).
+    request = json.loads(
+        '{"op":"agent.start","agent":"antigravity","project":"C:\\\\work","prompt":"Fix the tests"}'
+    )
+    assert request["op"] == "agent.start"
+    assert request["agent"] == "antigravity"
+    assert "provider" not in request
+    assert request["project"] == "C:\\work"
+
+
 # ---------------------------------------------------------------------------
 # C++ ApplyBridgeMessage port: state machine for agent status.
 # ---------------------------------------------------------------------------
@@ -91,7 +103,8 @@ def apply_bridge_message(state, json_text):
         b["agent_job_id"] = _json_string(json_text, "id")
         b["agent_running"] = True
         agent = _json_string(json_text, "agent")
-        b["active_agent"] = 1 if agent == "codex" else (2 if agent == "gemini" else 0)
+        # Google slot (2) covers both the legacy gemini CLI and Antigravity.
+        b["active_agent"] = 1 if agent == "codex" else (2 if agent in ("gemini", "antigravity") else 0)
         b["agent_status"] = "Running"
         b["gemini_login_unavailable"] = False
     if '"agents":' in json_text:
@@ -105,7 +118,9 @@ def apply_bridge_message(state, json_text):
             bridge_state_from_name(_json_string(json_text, key))
             for key in ("agent_state_claude", "agent_state_codex", "agent_state_gemini")
         ]
-        b["gemini_api_provider"] = '"agent_provider_gemini":"api"' in json_text
+        # Google slot provider: 1 antigravity, 2 api, 3 legacy cli, 0 none.
+        provider = _json_string(json_text, "agent_provider_gemini")
+        b["google_provider"] = 1 if provider == "antigravity" else (2 if provider == "api" else (3 if provider == "cli" else 0))
     if '"type":"agent"' in json_text:
         b["agent_running"] = True
         phase = _json_string(json_text, "phase")
@@ -149,7 +164,7 @@ def fresh_state():
             "active_agent": -1, "agent_status": "", "agent_output": "",
             "agents_detected": [False, False, False],
             "agents_state": [0, 0, 0],
-            "gemini_api_provider": False, "gemini_login_unavailable": False,
+            "google_provider": 0, "gemini_login_unavailable": False,
         }
     }
 
@@ -172,7 +187,32 @@ def test_agent_state_machine_contract():
     b = state["bridge"]
     assert b["online"] is True
     assert b["agents_state"] == [2, 1, 0]
-    assert b["gemini_api_provider"] is False
+    assert b["google_provider"] == 0
+
+    # Google slot reporting Antigravity ready.
+    state = apply_bridge_message(state, jdump({
+        "ok": True, "bridge": "online",
+        "agents": {"claude": True, "codex": True, "gemini": True},
+        "agent_state_claude": "ready", "agent_state_codex": "ready",
+        "agent_state_gemini": "ready", "agent_provider_gemini": "antigravity",
+    }))
+    assert state["bridge"]["google_provider"] == 1
+    # Gemini API fallback provider.
+    state = apply_bridge_message(state, jdump({
+        "ok": True, "bridge": "online",
+        "agents": {"claude": True, "codex": True, "gemini": True},
+        "agent_state_claude": "ready", "agent_state_codex": "ready",
+        "agent_state_gemini": "ready", "agent_provider_gemini": "api",
+    }))
+    assert state["bridge"]["google_provider"] == 2
+    # Legacy Gemini CLI provider.
+    state = apply_bridge_message(state, jdump({
+        "ok": True, "bridge": "online",
+        "agents": {"claude": True, "codex": True, "gemini": True},
+        "agent_state_claude": "ready", "agent_state_codex": "ready",
+        "agent_state_gemini": "ready", "agent_provider_gemini": "cli",
+    }))
+    assert state["bridge"]["google_provider"] == 3
 
     # Gemini API provider start ack resets the login-unavailable hint.
     ack = jdump({"ok": True, "id": "job-1", "agent": "gemini", "project": "C:\\w", "provider": "api"})
@@ -181,6 +221,11 @@ def test_agent_state_machine_contract():
     state = apply_bridge_message(state, ack)
     assert b["agent_job_id"] == "job-1" and b["active_agent"] == 2
     assert b["agent_running"] is True and b["gemini_login_unavailable"] is False
+
+    # Antigravity start ack lands on the Google slot (index 2).
+    ack = jdump({"ok": True, "id": "job-9", "agent": "antigravity", "project": "C:\\w"})
+    state = apply_bridge_message(state, ack)
+    assert b["agent_job_id"] == "job-9" and b["active_agent"] == 2
 
     # Phases from the Gemini API agent normalize to the richer C++ labels.
     for phase, label in (("reading_file", "Reading file"), ("editing_file", "Editing file"),
@@ -249,11 +294,18 @@ def test_discovery_variants(tmp_path=None):
     ]
     search_dirs = [path_dir, appdata_npm, localappdata_npm, npm_global, programs]
 
+    # Antigravity's official install folder (%LOCALAPPDATA%\agy\bin) is a
+    # first-class search location, found without waiting for a PATH refresh.
+    agy_bin = str(os.path.join(root, "LOCAL", "agy", "bin"))
+    files.append(os.path.join(agy_bin, "agy.exe"))
+    search_dirs.append(agy_bin)
+
     assert fake_find("claude", files, search_dirs) == os.path.join(path_dir, "claude.exe")
     assert fake_find("codex", files, search_dirs) == os.path.join(appdata_npm, "codex.cmd")
     assert fake_find("gemini", files, search_dirs) == os.path.join(localappdata_npm, "gemini.bat")
     assert fake_find("node", files, search_dirs) == os.path.join(npm_global, "node.ps1")
     assert fake_find("git", files, search_dirs) == os.path.join(programs, "git")  # extensionless
+    assert fake_find("agy", files, search_dirs) == os.path.join(agy_bin, "agy.exe")
     assert fake_find("missing", files, search_dirs) is None
     # where.exe fallback only kicks in when no directory hit.
     where = {"missing": os.path.join(root, "extra", "missing.exe")}
@@ -279,21 +331,38 @@ def test_discovery_extension_priority():
 # (2)/(4) Readiness: gemini reports READY via the API even without the CLI.
 # ---------------------------------------------------------------------------
 
-def check_gemini(cli_state, api_ok):
-    """Port of AgentReadiness.CheckGemini (state, provider)."""
-    if cli_state == "ready":
-        return ("ready", "cli")
+def check_google(antigravity_state, api_ok, legacy_state):
+    """Port of AgentReadiness.CheckGoogle: preference order is
+    1. Antigravity (current individual path)
+    2. Gemini API (fallback, works without any CLI)
+    3. Legacy Gemini CLI (enterprise/Cloud only)
+    Returns (state, provider)."""
+    if antigravity_state == "ready":
+        return ("ready", "antigravity")
     if api_ok:
         return ("ready", "api")
-    return (cli_state, None)
+    if legacy_state == "ready":
+        return ("ready", "cli")
+    if antigravity_state != "not_installed":
+        return (antigravity_state, "antigravity")
+    if legacy_state != "not_installed":
+        return (legacy_state, "cli")
+    return ("not_installed", "antigravity")
 
 
-def test_gemini_api_readiness():
-    assert check_gemini("not_installed", True) == ("ready", "api")
-    assert check_gemini("auth_required", True) == ("ready", "api")
-    assert check_gemini("ready", False) == ("ready", "cli")
-    assert check_gemini("not_installed", False) == ("not_installed", None)
-    assert check_gemini("error", False) == ("error", None)
+def test_google_slot_provider_preference():
+    # Antigravity wins when it is ready, regardless of the API key.
+    assert check_google("ready", True, "ready") == ("ready", "antigravity")
+    # Gemini API fallback when Antigravity is unavailable but the key works.
+    assert check_google("not_installed", True, "ready") == ("ready", "api")
+    assert check_google("auth_required", True, "not_installed") == ("ready", "api")
+    # Legacy Gemini CLI only when Antigravity and the API are both unavailable.
+    assert check_google("not_installed", False, "ready") == ("ready", "cli")
+    # Nothing ready: report the most actionable installed state.
+    assert check_google("auth_required", False, "not_installed") == ("auth_required", "antigravity")
+    assert check_google("not_installed", False, "auth_required") == ("auth_required", "cli")
+    assert check_google("error", False, "not_installed") == ("error", "antigravity")
+    assert check_google("not_installed", False, "not_installed") == ("not_installed", "antigravity")
 
 
 # ---------------------------------------------------------------------------
@@ -437,10 +506,11 @@ if __name__ == "__main__":
     test_calendar_response_parsing()
     test_reconnect_cancellation_and_unsupported_agent_contracts()
     test_gemini_api_start_wire_format()
+    test_antigravity_start_wire_format()
     test_agent_state_machine_contract()
     test_discovery_variants()
     test_discovery_extension_priority()
-    test_gemini_api_readiness()
+    test_google_slot_provider_preference()
     test_tool_sandbox()
     test_command_allowlist()
     test_cancellation_contract()
