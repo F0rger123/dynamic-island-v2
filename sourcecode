@@ -788,19 +788,9 @@ void LoadSettings() {
 }
 
 void EnableBlurBehind(HWND hwnd) {
-    // Layered windows cannot use the old DWM blur region reliably. Ask DWM for
-    // a translucent Mica/Acrylic backdrop when the OS supports it; the D2D
-    // surface remains the portable fallback on Windows 10 and older builds.
-    constexpr DWORD kDwmwaSystemBackdropType = 38;
-    constexpr int kDwmSystemBackdropAcrylic = 3;
-    DwmSetWindowAttribute(hwnd, kDwmwaSystemBackdropType,
-                          &kDwmSystemBackdropAcrylic,
-                          sizeof(kDwmSystemBackdropAcrylic));
-
-    DWM_BLURBEHIND blur = {};
-    blur.dwFlags = DWM_BB_ENABLE;
-    blur.fEnable = TRUE;
-    DwmEnableBlurBehindWindow(hwnd, &blur);
+    // The renderer supplies the alpha surface. Do not apply Mica/blur to the
+    // host window: DWM backdrop material paints the entire host rectangle and
+    // produces the visible gray box around the island.
 }
 
 
@@ -4433,6 +4423,8 @@ class Renderer {
             target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY + 0.5f * spacing), r, r), tab == 2 ? activeDot.Get() : inactiveDot.Get());
             target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, dotY + 1.5f * spacing), r, r), tab == 3 ? activeDot.Get() : inactiveDot.Get());
 
+            // Keep navigation visible and clickable in every expanded page.
+            DrawPageDots(rect, tab, 4, 1.0f);
             target_->PopLayer();
         }
 
@@ -5399,6 +5391,7 @@ DWORD WINAPI KeyboardThreadProc(void*) {
 
 struct AgentInputControls { HWND window = nullptr; HWND agent = nullptr; HWND provider = nullptr; HWND project = nullptr; HWND prompt = nullptr; };
 AgentInputControls g_agentInput;
+HBRUSH g_agentInputBackground = CreateSolidBrush(RGB(18, 20, 26));
 int g_agentInputPrefAgent = -1;
 // Google-slot provider preference: -1 = auto (bridge-ready provider),
 // 0 = Antigravity CLI, 1 = Gemini API, 2 = legacy Gemini CLI.
@@ -5440,6 +5433,14 @@ void ApplyAgentInputProviderSelection(HWND hwnd) {
 }
 LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT:
+        case WM_CTLCOLORLISTBOX:
+        case WM_CTLCOLORBTN: {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, RGB(235, 238, 245)); SetBkColor(dc, RGB(18, 20, 26));
+            return reinterpret_cast<LRESULT>(g_agentInputBackground);
+        }
         case WM_CREATE: {
             g_agentInput.window = hwnd;
             CreateWindowW(L"STATIC", L"Agent", WS_CHILD | WS_VISIBLE, 16, 14, 70, 22, hwnd, nullptr, nullptr, nullptr);
@@ -5505,7 +5506,7 @@ LRESULT CALLBACK AgentInputWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 DWORD WINAPI AgentInputThreadProc(void*) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     static const wchar_t kClass[] = L"DynamicIsland.AgentInput"; WNDCLASSW wc = {}; wc.lpfnWndProc = AgentInputWndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = kClass; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); RegisterClassW(&wc);
-    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kClass, L"Run local AI agent", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 560, 352, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED, kClass, L"", WS_POPUP | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 560, 352, nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) { UnregisterClassW(kClass, wc.hInstance); if (SUCCEEDED(hr)) CoUninitialize(); return 0; }
     ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd);
     MSG msg; while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); } UnregisterClassW(kClass, wc.hInstance); if (SUCCEEDED(hr)) CoUninitialize(); return 0;
@@ -5664,6 +5665,22 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
                 const float width = static_cast<float>(clientRect.right - clientRect.left);
 
+                // Page dots are an explicit hit target; consume the click so it
+                // never toggles/collapses the island or launches the media app.
+                if (height > 60.0f) {
+                    const int dotCount = mediaActive ? 4 : 3;
+                    const float dotX = width - 10.0f;
+                    const float dotY = height * 0.5f;
+                    if (xPos > dotX - 18.0f && xPos < dotX + 8.0f) {
+                        const int picked = static_cast<int>(std::round((yPos - (dotY - (dotCount - 1) * 4.0f)) / 8.0f));
+                        if (picked >= 0 && picked < dotCount) {
+                            g_idleTab = picked;
+                            g_layoutDirty = true;
+                            return 0;
+                        }
+                    }
+                }
+
                 if (mediaActive && height > 60.0f && (g_idleTab % 4) == 0) {
                     float totalScale = (GetDpiForWindow(hwnd) / 96.0f) * g_settings.sizeScale;
                     float cx = width / 2.0f;
@@ -5717,7 +5734,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (mediaActive) {
                     if (height > 45.0f && xPos > width - 30.0f) {
                         // Clicked on the right edge scroll area in Media
-                        g_idleTab = (g_idleTab + 1) % 3;
+                        g_idleTab = (g_idleTab + 1) % 4;
                         g_layoutDirty = true;
                     } else {
                         OpenRelevantApp();
@@ -5761,9 +5778,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             int tabCount = mediaActive ? 4 : 3;
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             if (delta > 0) {
-                if (g_idleTab > 0) g_idleTab--;
+                g_idleTab = (g_idleTab + tabCount - 1) % tabCount;
             } else if (delta < 0) {
-                if (g_idleTab < tabCount - 1) g_idleTab++;
+                g_idleTab = (g_idleTab + 1) % tabCount;
             }
             
             g_layoutDirty = true;

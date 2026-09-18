@@ -26,4 +26,7 @@ if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 New-Item -ItemType Directory -Path $out -Force | Out-Null
 Invoke-Checked { dotnet publish $project -c Release -r win-x64 --self-contained false --no-restore -o $out } 'dotnet publish'
 Copy-Item (Join-Path $root 'sourcecode') $out
+# The same signed/published bridge binary acts as a setup-only launcher when
+# named Setup.exe; this keeps the normal flow double-clickable without a second runtime.
+Copy-Item (Join-Path $out 'DynamicIslandBridge.exe') (Join-Path $out 'Setup.exe') -Force
 Write-Host "Release package written to $out" -ForegroundColor Green

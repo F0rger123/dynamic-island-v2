@@ -1,4 +1,12 @@
-# Dynamic Island v2
+# Dynamic Island
+
+## Quick install
+
+1. Download the `DynamicIslandBridge-win-x64` package.
+2. Double-click **Setup.exe** (the package includes it; it always opens setup).
+3. Follow the plain-language wizard, then enable the bundled Windhawk source.
+
+The advanced fallback is `DynamicIslandBridge.exe --setup`. v2
 
 A macOS-style Dynamic Island for Windows: a small pill floating at the top of
 your screen that shows media (Spotify), Google Calendar, AI coding agents, and

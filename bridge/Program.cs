@@ -24,7 +24,9 @@ internal static class Program
     public static async Task Main()
     {
         Directory.CreateDirectory(DataDir);
-        if (Environment.GetCommandLineArgs().Any(a => string.Equals(a, "--setup", StringComparison.OrdinalIgnoreCase))) SetupState.ShowAgain(); else SetupState.ShowIfFirstRun();
+        var executableName = Path.GetFileNameWithoutExtension(Environment.ProcessPath ?? "");
+        if (string.Equals(executableName, "Setup", StringComparison.OrdinalIgnoreCase) || Environment.GetCommandLineArgs().Any(a => string.Equals(a, "--setup", StringComparison.OrdinalIgnoreCase))) SetupState.ShowAgain();
+        else SetupState.ShowIfFirstRun();
         while (true)
         {
             try { await ServeClient(await CreatePipe()); }
@@ -89,7 +91,11 @@ internal static class Program
                 break;
             }
             case "calendar.auth": await Send(w, new { ok = await Calendar.Auth(), state = "authorized" }); break;
-            case "calendar.today": await Send(w, new { ok = true, events = await Calendar.Today() }); break;
+            case "calendar.today":
+                try { await Send(w, new { ok = true, events = await Calendar.Today() }); }
+                catch (Exception e) when (e.Message.Contains("calendar_auth_required", StringComparison.OrdinalIgnoreCase) || e is HttpRequestException)
+                { await Send(w, new { ok = false, error = "calendar_auth_required", state = "reconnect_required", events = Array.Empty<object>() }); }
+                break;
             case "gemini.api.test":
             {
                 if (!GeminiApi.HasKey()) { await Send(w, new { ok = false, error = "gemini_api_key_required", provider = "gemini-api" }); break; }
