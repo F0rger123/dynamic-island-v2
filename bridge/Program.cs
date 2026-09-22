@@ -35,6 +35,7 @@ internal static class Program
     }
 
     internal static Task<bool> ConnectGoogleCalendar() => Calendar.Auth();
+    internal static Task<string> CalendarState() => Calendar.State();
 
     static async Task<NamedPipeServerStream> CreatePipe()
     {
@@ -170,6 +171,7 @@ internal static class Program
         if (!p.Start()) throw new InvalidOperationException("agent_start_failed");
         var id = Guid.NewGuid().ToString("N"); lock (JobsLock) Jobs[id] = p;
         await Send(w, new { ok = true, id, agent, project = root });
+        await Send(w, new { type = "agent.status", agent, provider = agent == "antigravity" ? "antigravity" : agent == "gemini" ? "cli" : agent, job_id = id, project = root, phase = "working", timestamp = DateTimeOffset.UtcNow });
         _ = StreamOutput(id, p, w, agent);
     }
 
@@ -229,7 +231,15 @@ internal static class Program
             while ((line = await s.ReadLineAsync()) != null)
             {
                 if (agent == "gemini" && LooksLikeGeminiLoginError(line)) authFailed = true;
-                try { await Send(w, new { type = "agent", id, stream, normalized = NormalizeEvent(line), data = line }); }
+                try
+                {
+                    var lower = line.ToLowerInvariant();
+                    var kind = lower.Contains("rate limit") || lower.Contains("too many requests") || lower.Contains("429") ? "agent.rate_limit" :
+                        lower.Contains("unauthorized") || lower.Contains("authentication required") || lower.Contains("sign in") ? "agent.auth_required" :
+                        (lower.Contains("?\"") || lower.EndsWith("?") || lower.Contains("approve this") || lower.Contains("should i")) ? "agent.question" : "agent.output";
+                    await Send(w, new { type = kind, agent, provider = agent == "antigravity" ? "antigravity" : agent == "gemini" ? "cli" : agent, job_id = id, phase = kind == "agent.question" ? "waiting_for_input" : "working", message = line, question = kind == "agent.question" ? line : null, retry_after = (string?)null, timestamp = DateTimeOffset.UtcNow });
+                    await Send(w, new { type = "agent", id, stream, normalized = NormalizeEvent(line), data = line });
+                }
                 catch { break; }
             }
         }
@@ -239,7 +249,11 @@ internal static class Program
         {
             try { await Send(w, new { type = "gemini_login_unavailable", id, agent = "gemini" }); } catch { }
         }
-        try { await Send(w, new { type = "exit", id, code = p.ExitCode }); } catch { }
+        try
+        {
+            await Send(w, new { type = p.ExitCode == 0 ? "agent.completed" : "agent.error", agent, job_id = id, phase = p.ExitCode == 0 ? "completed" : "error", summary = p.ExitCode == 0 ? "Agent finished" : "Agent exited with an error", code = p.ExitCode, timestamp = DateTimeOffset.UtcNow });
+            await Send(w, new { type = "exit", id, code = p.ExitCode });
+        } catch { }
         lock (JobsLock) Jobs.Remove(id);
         p.Dispose();
     }
@@ -318,6 +332,14 @@ internal static class Program
         record Token(string access_token, string refresh_token, long expires_at);
         static string TokenFile => Path.Combine(DataDir, "google-token.bin");
         static Token? Load() { if (!File.Exists(TokenFile)) return null; try { var b = ProtectedData.Unprotect(File.ReadAllBytes(TokenFile), null, DataProtectionScope.CurrentUser); return JsonSerializer.Deserialize<Token>(b); } catch { return null; } }
+        public static async Task<string> State()
+        {
+            if (Load() is null) return "not_connected";
+            try { _ = await AccessToken(); return "connected"; }
+            catch (HttpRequestException) { return "reconnect_required"; }
+            catch { return "error"; }
+        }
+
         public static async Task<bool> Auth()
         {
             var saved = CredentialStore.LoadGoogle();

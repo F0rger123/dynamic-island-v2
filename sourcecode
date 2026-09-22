@@ -496,6 +496,27 @@ void ApplyBridgeMessage(const std::string& json) {
         const std::wstring google = BridgeJsonString(json, "agent_provider_gemini");
         b.googleProvider = google == L"antigravity" ? 1 : (google == L"api" ? 2 : (google == L"cli" ? 3 : 0));
     }
+    if (json.find("\"type\":\"agent.question\"") != std::string::npos ||
+        json.find("\"type\":\"agent.rate_limit\"") != std::string::npos ||
+        json.find("\"type\":\"agent.auth_required\"") != std::string::npos ||
+        json.find("\"type\":\"agent.error\"") != std::string::npos) {
+        b.agentStatus = BridgeJsonString(json, "phase");
+        b.agentOutput = BridgeJsonString(json, "message");
+        b.agentRunning = json.find("agent.question") != std::string::npos;
+        b.notification.active = true;
+        b.notification.title = BridgeJsonString(json, "type");
+        b.notification.body = b.agentOutput;
+        b.notification.expiresAt = NowSeconds() + 8.0;
+    }
+    if (json.find("\"type\":\"agent.completed\"") != std::string::npos || json.find("\"type\":\"agent.cancelled\"") != std::string::npos) {
+        b.agentRunning = false;
+        b.agentStatus = BridgeJsonString(json, "phase");
+        b.agentOutput = BridgeJsonString(json, "summary");
+        b.notification.active = true;
+        b.notification.title = BridgeJsonString(json, "type");
+        b.notification.body = b.agentOutput;
+        b.notification.expiresAt = NowSeconds() + 6.0;
+    }
     if (json.find("\"type\":\"agent\"") != std::string::npos) {
         b.agentRunning = true;
         const std::wstring phase = BridgeJsonString(json, "phase");
@@ -3603,6 +3624,9 @@ class Renderer {
     void DrawAgentsDashboard(const SharedState& state, D2D1_RECT_F rect, float scale) {
         const auto& b = state.bridge;
         target_->DrawTextW(L"AI AGENTS", 9, boldTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.top + 14 * scale, rect.right - 20 * scale, rect.top + 36 * scale), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        // Local CLIs do not expose a reliable quota endpoint. Never invent a
+        // percentage; make the limitation explicit in the status strip.
+        target_->DrawTextW(L"C  X  G  ·  usage unavailable", 29, smallTextFormat_.Get(), D2D1::RectF(rect.left + 22 * scale, rect.top + 35 * scale, rect.right - 20 * scale, rect.top + 52 * scale), mutedBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
         const wchar_t* names[] = {L"C  Claude Code", L"X  Codex", L"G  Google"};
         for (int i = 0; i < 3; ++i) {
             const float y = rect.top + (48 + i * 27) * scale;
@@ -5665,20 +5689,29 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 const float height = static_cast<float>(clientRect.bottom - clientRect.top);
                 const float width = static_cast<float>(clientRect.right - clientRect.left);
 
-                // Page dots are an explicit hit target; consume the click so it
-                // never toggles/collapses the island or launches the media app.
+                // Match the actual dot geometry: media dots are horizontal at
+                // the bottom; idle dots are vertical at the right edge. Use a
+                // forgiving hit box, and consume the click before other actions.
                 if (height > 60.0f) {
                     const int dotCount = mediaActive ? 4 : 3;
-                    const float dotX = width - 10.0f;
-                    const float dotY = height * 0.5f;
-                    if (xPos > dotX - 18.0f && xPos < dotX + 8.0f) {
-                        const int picked = static_cast<int>(std::round((yPos - (dotY - (dotCount - 1) * 4.0f)) / 8.0f));
-                        if (picked >= 0 && picked < dotCount) {
-                            g_idleTab = picked;
-                            g_layoutDirty = true;
-                            return 0;
+                    int picked = -1;
+                    if (mediaActive) {
+                        const float gap = 6.0f;
+                        const float total = dotCount * 3.0f + (dotCount - 1) * gap;
+                        const float start = (width - total) * 0.5f;
+                        if (yPos >= height - 22.0f && yPos <= height - 1.0f && xPos >= start - 8.0f && xPos <= start + total + 8.0f) {
+                            const int candidate = static_cast<int>(std::round((xPos - start) / (3.0f + gap)));
+                            if (candidate >= 0 && candidate < dotCount) picked = candidate;
+                        }
+                    } else {
+                        const float dotX = width - 10.0f;
+                        const float dotY = height * 0.5f;
+                        if (xPos >= dotX - 18.0f && xPos <= dotX + 8.0f) {
+                            const int candidate = static_cast<int>(std::round((yPos - (dotY - (dotCount - 1) * 4.0f)) / 8.0f));
+                            if (candidate >= 0 && candidate < dotCount) picked = candidate;
                         }
                     }
+                    if (picked >= 0) { g_idleTab = picked; g_layoutDirty = true; return 0; }
                 }
 
                 if (mediaActive && height > 60.0f && (g_idleTab % 4) == 0) {

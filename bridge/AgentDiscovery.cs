@@ -499,3 +499,18 @@ internal static class AgentReadiness
         _ => "Error",
     };
 }
+
+internal static class WindhawkDiscovery
+{
+    internal static string? Find()
+    {
+        var candidates = new[] {
+            Environment.GetEnvironmentVariable("WINDHAWK_PATH"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Windhawk", "windhawk.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Windhawk", "windhawk.exe")
+        };
+        foreach (var candidate in candidates)
+            if (!string.IsNullOrWhiteSpace(candidate) && File.Exists(candidate)) return candidate;
+        return null;
+    }
+}

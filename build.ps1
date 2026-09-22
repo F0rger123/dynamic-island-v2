@@ -30,3 +30,10 @@ Copy-Item (Join-Path $root 'sourcecode') $out
 # named Setup.exe; this keeps the normal flow double-clickable without a second runtime.
 Copy-Item (Join-Path $out 'DynamicIslandBridge.exe') (Join-Path $out 'Setup.exe') -Force
 Write-Host "Release package written to $out" -ForegroundColor Green
+
+$iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+if ($null -ne $iscc) {
+    Invoke-Checked { & $iscc.Source (Join-Path $root 'DynamicIslandSetup.iss') } 'Inno Setup installer'
+} else {
+    Write-Host 'ISCC.exe not found; package contents remain available under artifacts/DynamicIslandBridge.' -ForegroundColor Yellow
+}

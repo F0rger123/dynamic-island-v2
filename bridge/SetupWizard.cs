@@ -58,6 +58,7 @@ internal sealed class SetupWizard : Form
     readonly Label[] checks = new Label[8];
     readonly Label[] agentStatusLabels = new Label[4];
     TextBox geminiKeyBox = null!;
+    Label calendarState = null!;
 
     public SetupWizard()
     {
@@ -70,6 +71,7 @@ internal sealed class SetupWizard : Form
     {
         base.OnShown(e);
         for (var i = 0; i < RowAgents.Length; i++) RefreshAgentRow(i, force: false);
+        _ = Task.Run(async () => { var state = await Program.CalendarState(); BeginInvoke(() => calendarState.Text = state switch { "connected" => "✓ Connected", "reconnect_required" => "! Reconnect required", "not_connected" => "Not connected", _ => "Error checking Calendar" }); });
     }
 
     static Label Heading(string text) => new() { Text = text, Font = new Font("Segoe UI", 18, FontStyle.Bold), AutoSize = true, Location = new Point(28, 24) };
@@ -110,7 +112,7 @@ internal sealed class SetupWizard : Form
         {
             ("Windows", Environment.OSVersion.VersionString),
             (".NET runtime", Environment.Version.ToString()),
-            ("Windhawk", "Install/enable the source mod"),
+            ("Windhawk", WindhawkDiscovery.Find() is null ? "Not installed" : "✓ Ready  " + WindhawkDiscovery.Find()),
             ("Claude Code", Describe(claude, false)),
             ("Codex CLI", Describe(codex, false)),
             ("Google (Antigravity/API)", Describe(google, true)),
@@ -121,7 +123,9 @@ internal sealed class SetupWizard : Form
     }
     TabPage GooglePage()
     {
-        var p = Page("Google Calendar"); p.Controls.Add(new Label { Text = "1. Open Google setup.\n2. Enable Calendar API and create a Desktop OAuth client.\n3. Select the downloaded credentials JSON file.\n4. Connect when ready.", AutoSize = true, Location = new Point(36, 76), Font = new Font("Segoe UI", 10) });
+        var p = Page("Google Calendar");
+        calendarState = new Label { Text = "Checking…", AutoSize = true, ForeColor = Color.DarkGoldenrod, Location = new Point(36, 58) }; p.Controls.Add(calendarState);
+        p.Controls.Add(new Label { Text = "1. Open Google setup.\n2. Enable Calendar API and create a Desktop OAuth client.\n3. Select the downloaded credentials JSON file.\n4. Connect when ready.", AutoSize = true, Location = new Point(36, 76), Font = new Font("Segoe UI", 10) });
         var open = Button("Open Google Cloud Console", (_, _) => Open("https://console.cloud.google.com/apis/credentials")); open.Location = new Point(36, 178); p.Controls.Add(open);
         var api = Button("Open Calendar API", (_, _) => Open("https://console.cloud.google.com/apis/library/calendar-json.googleapis.com")); api.Location = new Point(220, 178); p.Controls.Add(api);
         var select = Button("Select credentials JSON", SelectGoogle); select.Location = new Point(36, 225); p.Controls.Add(select);

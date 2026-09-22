@@ -237,3 +237,12 @@ assert "named pipe" in readme.lower()
 assert "build.ps1" in readme
 
 print("static contract checks passed")
+
+# Runtime completion-pass contracts.
+assert 'agent.completed' in program and 'agent.question' in program
+assert 'agent.rate_limit' in program and 'agent.auth_required' in program
+assert 'agent.error' in program and 'agent.output' in program
+assert 'usage unavailable' in source.lower()
+assert (root / "DynamicIslandSetup.iss").exists()
+assert 'Setup.exe' in (root / 'build.ps1').read_text(encoding='utf-8')
+assert 'WindhawkDiscovery' in discovery
