@@ -1,4 +1,83 @@
-# Dynamic Island
+<p align="center">
+  <img src=".github/assets/banner.svg" alt="DYNAMIC ISLAND: The macOS Dynamic Island, rebuilt for Windows." width="100%">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/status-public-a855f7?style=for-the-badge" alt="Public">
+  <img src="https://img.shields.io/badge/license-MIT-a855f7?style=for-the-badge" alt="License">
+  <img src="https://img.shields.io/github/last-commit/F0rger123/dynamic-island-v2?style=for-the-badge&color=a855f7" alt="Last commit">
+  <img src="https://img.shields.io/github/repo-size/F0rger123/dynamic-island-v2?style=for-the-badge&color=a855f7" alt="Repo size">
+</p>
+<p align="center">
+  <img src="https://img.shields.io/badge/C%2523-0d1117?style=flat-square&logo=sharp&logoColor=white" alt="C#">
+  <img src="https://img.shields.io/badge/.NET%208-0d1117?style=flat-square&logo=dotnet&logoColor=white" alt=".NET 8">
+  <img src="https://img.shields.io/badge/Windows-0d1117?style=flat-square&logo=windows11&logoColor=white" alt="Windows">
+  <img src="https://img.shields.io/badge/Python-0d1117?style=flat-square&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/Claude-0d1117?style=flat-square&logo=claude&logoColor=white" alt="Claude">
+  <img src="https://img.shields.io/badge/OpenAI%20API-0d1117?style=flat-square&logo=openai&logoColor=white" alt="OpenAI API">
+  <img src="https://img.shields.io/badge/Gemini-0d1117?style=flat-square&logo=googlegemini&logoColor=white" alt="Gemini">
+  <img src="https://img.shields.io/badge/GitHub%20Actions-0d1117?style=flat-square&logo=githubactions&logoColor=white" alt="GitHub Actions">
+</p>
+
+<h3 align="center">A small pill at the top of your Windows screen for Spotify, Google Calendar, AI coding agents and the weather.</h3>
+
+<p align="center">
+  <a href="#-the-four-pages">Pages</a> ·
+  <a href="#-how-it-fits-together">How it works</a> ·
+  <a href="#-install-in-60-seconds">Install</a> ·
+  <a href="#-code-composition">Composition</a> ·
+  <a href="#-field-manual">Field manual</a> ·
+  <a href="#-license">License</a>
+</p>
+
+<p align="center"><img src=".github/assets/divider.svg" width="100%" alt=""></p>
+
+## 💊 The four pages
+
+| Page | Shows |
+|---|---|
+| 🎵 **Media** | Artwork, title, artist, play / pause / skip for Spotify or any system media session |
+| 📅 **Calendar** | Next event with countdown and location, plus the rest of today |
+| 🤖 **AI agents** | Live status for Claude Code, Codex, Antigravity and a built-in Gemini API agent |
+| 🌦️ **Weather & system** | Temperature, conditions, mic and camera indicators |
+
+## 🔌 How it fits together
+
+The overlay keeps working when the bridge is offline. Nothing listens on the network.
+
+```mermaid
+flowchart LR
+    subgraph Desktop["🪟 Windows session"]
+        Mod["Windhawk mod<br/>(the pill)"] <-->|"named pipe<br/>per-user ACL"| Bridge["DynamicIslandBridge.exe<br/>.NET 8"]
+        SMTC["System media session"] --> Mod
+    end
+    Bridge --> Cal["📅 Google Calendar<br/>read-only OAuth"]
+    Bridge --> CC["Claude Code"]
+    Bridge --> CX["OpenAI Codex"]
+    Bridge --> AG["Google Antigravity"]
+    Bridge --> GA["Gemini API agent"]
+```
+
+## 🚀 Install in 60 seconds
+
+```mermaid
+flowchart LR
+    A["⬇️ Download<br/>DynamicIslandBridge-win-x64"] --> B["📂 Extract to a<br/>permanent folder"] --> C["🧙 Setup.exe<br/>wizard"] --> D["🧩 Paste sourcecode<br/>into Windhawk"] --> E["✨ Compile + enable"]
+```
+
+## 📊 Code composition
+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'pie1':'#a855f7','pie2':'#22d3ee','pie3':'#64748b','pie4':'#94a3b8','pie5':'#475569','pie6':'#cbd5e1','pie7':'#334155','pieStrokeColor':'#0d1117','pieOuterStrokeColor':'#0d1117','pieTitleTextColor':'#8b949e','pieLegendTextColor':'#8b949e','pieSectionTextColor':'#0d1117'}}}%%
+pie title Code composition (% of bytes, via GitHub linguist)
+    "C#" : 70.6
+    "Python" : 27.8
+    "PowerShell" : 1.5
+```
+
+<p align="center"><img src=".github/assets/divider.svg" width="100%" alt=""></p>
+
+## 📚 Field manual
 
 ## Quick install
 
@@ -449,3 +528,13 @@ by Windhawk itself on the user's machine (see
    to a GitHub release (the tag is optional but conventional).
 3. Tell users to re-paste the new `sourcecode` into Windhawk if the overlay
    protocol changed.
+
+## 📜 License
+
+Released under the [MIT License](LICENSE). Use it, fork it, ship it.
+
+<p align="center"><img src=".github/assets/divider.svg" width="100%" alt=""></p>
+
+<p align="center">
+  <sub>Built by <a href="https://github.com/F0rger123"><b>@F0rger123</b></a> · MIT licensed</sub>
+</p>

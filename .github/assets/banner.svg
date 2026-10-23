@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="340" viewBox="0 0 1280 340" role="img" aria-label="DYNAMIC ISLAND: The macOS Dynamic Island, rebuilt for Windows.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#07070b"/><stop offset="1" stop-color="#11121c"/></linearGradient>
+    <linearGradient id="acc" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a855f7"/><stop offset="1" stop-color="#22d3ee"/></linearGradient>
+    <linearGradient id="ttl" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ffffff"/><stop offset=".55" stop-color="#a855f7"/><stop offset="1" stop-color="#22d3ee"/></linearGradient>
+    <linearGradient id="scan" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#a855f7" stop-opacity="0"/><stop offset=".5" stop-color="#a855f7" stop-opacity=".9"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></linearGradient>
+    <radialGradient id="ga"><stop offset="0" stop-color="#a855f7" stop-opacity=".42"/><stop offset="1" stop-color="#a855f7" stop-opacity="0"/></radialGradient>
+    <radialGradient id="gb"><stop offset="0" stop-color="#22d3ee" stop-opacity=".34"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></radialGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#ffffff" stroke-opacity=".045"/></pattern>
+    <clipPath id="clip"><rect width="1280" height="340" rx="20"/></clipPath>
+  </defs>
+  <style>
+    .sans{font-family:"Segoe UI","Inter","Helvetica Neue",Arial,sans-serif}
+    .mono{font-family:"JetBrains Mono","Cascadia Code",Consolas,"SFMono-Regular",Menlo,monospace}
+    .spin{animation:spin linear infinite}.rev{animation-direction:reverse}
+    .orb{animation:drift 16s ease-in-out infinite alternate}.orb2{animation:drift2 20s ease-in-out infinite alternate}
+    .scan{animation:scan 7s linear infinite}.blink{animation:blink 1.1s steps(1) infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @keyframes drift{to{transform:translate(140px,40px)}}
+    @keyframes drift2{to{transform:translate(-160px,-30px)}}
+    @keyframes scan{from{transform:translateX(-500px)}to{transform:translateX(1500px)}}
+    @keyframes blink{50%{opacity:0}}
+    @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+  </style>
+  <g clip-path="url(#clip)">
+    <rect width="1280" height="340" fill="url(#bg)"/>
+    <rect width="1280" height="340" fill="url(#grid)"/>
+    <circle class="orb" cx="260" cy="40" r="300" fill="url(#ga)"/>
+    <circle class="orb2" cx="1050" cy="320" r="320" fill="url(#gb)"/>
+    <g class="spin" style="transform-origin:1085px 196px;animation-duration:28s"><ellipse cx="1085" cy="196" rx="129.60000000000002" ry="52.800000000000004" fill="none" stroke="url(#acc)" stroke-width="2" stroke-opacity="0.9"/></g>
+    <g class="spin rev" style="transform-origin:1085px 196px;animation-duration:38s"><ellipse cx="1085" cy="196" rx="94.5" ry="38.5" fill="none" stroke="url(#acc)" stroke-width="1.25" stroke-opacity="0.68"/></g>
+    <g class="spin" style="transform-origin:1085px 196px;animation-duration:48s"><ellipse cx="1085" cy="196" rx="59.400000000000006" ry="24.200000000000003" fill="none" stroke="url(#acc)" stroke-width="1.25" stroke-opacity="0.46"/></g>
+    <circle cx="1085" cy="196" r="5" fill="#a855f7"/>
+    <text x="64" y="70" class="mono" font-size="14" letter-spacing="3" fill="#a855f7">◆ F0RGER123 / dynamic-island-v2</text>
+    <text x="1216" y="70" text-anchor="end" class="mono" font-size="12" letter-spacing="2" fill="#9a9aa8">PUBLIC · MIT</text>
+    <text x="64" y="174.56" class="sans" font-size="88" font-weight="800" letter-spacing="-2" fill="url(#ttl)">DYNAMIC ISLAND</text>
+    <text x="64" y="216.56" class="mono" font-size="19" fill="#c9c9d6">The macOS Dynamic Island, rebuilt for Windows.<tspan class="blink" fill="#a855f7"> ▍</tspan></text>
+    <g transform="translate(64,262)"><rect width="123" height="30" rx="15" fill="#a855f7" fill-opacity=".08" stroke="#a855f7" stroke-opacity=".45"/><text x="61.5" y="20" text-anchor="middle" class="mono" font-size="13" fill="#e7e7ee">C# / .NET 8</text></g>
+    <g transform="translate(197,262)"><rect width="97" height="30" rx="15" fill="#a855f7" fill-opacity=".08" stroke="#a855f7" stroke-opacity=".45"/><text x="48.5" y="20" text-anchor="middle" class="mono" font-size="13" fill="#e7e7ee">Windhawk</text></g>
+    <g transform="translate(304,262)"><rect width="123" height="30" rx="15" fill="#a855f7" fill-opacity=".08" stroke="#a855f7" stroke-opacity=".45"/><text x="61.5" y="20" text-anchor="middle" class="mono" font-size="13" fill="#e7e7ee">Named pipes</text></g>
+    <g transform="translate(437,262)"><rect width="226" height="30" rx="15" fill="#a855f7" fill-opacity=".08" stroke="#a855f7" stroke-opacity=".45"/><text x="113" y="20" text-anchor="middle" class="mono" font-size="13" fill="#e7e7ee">Claude · Codex · Gemini</text></g>
+    <text x="1216" y="306" text-anchor="end" class="mono" font-size="12" letter-spacing="3" fill="#6e6e7c">DI-V2</text>
+    <rect class="scan" x="0" y="337" width="420" height="3" fill="url(#scan)"/>
+  </g>
+  <rect x=".5" y=".5" width="1279" height="339" rx="20" fill="none" stroke="url(#acc)" stroke-opacity=".35"/>
+</svg>
