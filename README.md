@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/assets/banner.svg" alt="DYNAMIC ISLAND: The macOS Dynamic Island, rebuilt for Windows." width="100%">
+  <img src=".github/assets/banner.svg" alt="Dynamic Island: The macOS Dynamic Island, rebuilt for Windows." width="100%">
 </p>
 
 <p align="center">
@@ -22,10 +22,10 @@
 <h3 align="center">A small pill at the top of your Windows screen for Spotify, Google Calendar, AI coding agents and the weather.</h3>
 
 <p align="center">
-  <a href="#-the-four-pages">Pages</a> ·
-  <a href="#-how-it-fits-together">How it works</a> ·
-  <a href="#-install-in-60-seconds">Install</a> ·
-  <a href="#-code-composition">Composition</a> ·
+  <a href="#-the-four-pages">The four pages</a> ·
+  <a href="#-how-it-fits-together">How it fits together</a> ·
+  <a href="#-install-in-60-seconds">Install in 60 seconds</a> ·
+  <a href="#-code-composition">Code composition</a> ·
   <a href="#-field-manual">Field manual</a> ·
   <a href="#-license">License</a>
 </p>

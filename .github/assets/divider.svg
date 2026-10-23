@@ -1,6 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="14" viewBox="0 0 1280 14" role="presentation">
-  <defs><linearGradient id="d" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#a855f7" stop-opacity="0"/><stop offset=".5" stop-color="#a855f7"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></linearGradient></defs>
-  <style>.p{animation:p 4s ease-in-out infinite alternate}@keyframes p{from{opacity:.35}to{opacity:1}}@media (prefers-reduced-motion:reduce){.p{animation:none}}</style>
-  <rect class="p" x="0" y="6" width="1280" height="2" fill="url(#d)"/>
-  <circle cx="640" cy="7" r="4" fill="#a855f7"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="14" viewBox="0 0 1280 14"><defs><linearGradient id="d" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#a855f7" stop-opacity="0"/><stop offset=".5" stop-color="#a855f7"/><stop offset="1" stop-color="#22d3ee" stop-opacity="0"/></linearGradient></defs><rect x="0" y="6" width="1280" height="2" fill="url(#d)"/><circle cx="640" cy="7" r="4" fill="#a855f7"/></svg>
