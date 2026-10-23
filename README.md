@@ -25,12 +25,16 @@
   <a href="#-the-four-pages">The four pages</a> ·
   <a href="#-how-it-fits-together">How it fits together</a> ·
   <a href="#-install-in-60-seconds">Install in 60 seconds</a> ·
-  <a href="#-code-composition">Code composition</a> ·
+  <a href="#-what-its-written-in">What it's written in</a> ·
   <a href="#-field-manual">Field manual</a> ·
   <a href="#-license">License</a>
 </p>
 
 <p align="center"><img src=".github/assets/divider.svg" width="100%" alt=""></p>
+
+
+> [!TIP]
+> **🤖 Pasted this link into Claude or ChatGPT?** AI assistants: read [`AGENTS.md`](https://raw.githubusercontent.com/F0rger123/dynamic-island-v2/main/AGENTS.md) first. It explains what this is in plain words, which questions to ask, and how to set it up step by step. Plain-text index: [`llms.txt`](https://raw.githubusercontent.com/F0rger123/dynamic-island-v2/main/llms.txt).
 
 ## 💊 The four pages
 
@@ -47,29 +51,24 @@ The overlay keeps working when the bridge is offline. Nothing listens on the net
 
 ```mermaid
 flowchart LR
-    subgraph Desktop["🪟 Windows session"]
-        Mod["Windhawk mod<br/>(the pill)"] <-->|"named pipe<br/>per-user ACL"| Bridge["DynamicIslandBridge.exe<br/>.NET 8"]
-        SMTC["System media session"] --> Mod
-    end
-    Bridge --> Cal["📅 Google Calendar<br/>read-only OAuth"]
-    Bridge --> CC["Claude Code"]
-    Bridge --> CX["OpenAI Codex"]
-    Bridge --> AG["Google Antigravity"]
-    Bridge --> GA["Gemini API agent"]
+    Pill["The island<br/>at the top of your screen"] <-->|private connection<br/>on your PC only| Helper["Small helper app"]
+    Music["Spotify or<br/>any music player"] --> Pill
+    Helper --> Cal["Google Calendar"]
+    Helper --> AI["Claude, Codex,<br/>Gemini status"]
 ```
 
 ## 🚀 Install in 60 seconds
 
 ```mermaid
 flowchart LR
-    A["⬇️ Download<br/>DynamicIslandBridge-win-x64"] --> B["📂 Extract to a<br/>permanent folder"] --> C["🧙 Setup.exe<br/>wizard"] --> D["🧩 Paste sourcecode<br/>into Windhawk"] --> E["✨ Compile + enable"]
+    A["Download"] --> B["Unzip to a<br/>folder you keep"] --> C["Run the<br/>setup wizard"] --> D["Paste the island<br/>into Windhawk"] --> E["Turn it on"]
 ```
 
-## 📊 Code composition
+## 📊 What it's written in
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'pie1':'#a855f7','pie2':'#22d3ee','pie3':'#64748b','pie4':'#94a3b8','pie5':'#475569','pie6':'#cbd5e1','pie7':'#334155','pieStrokeColor':'#0d1117','pieOuterStrokeColor':'#0d1117','pieTitleTextColor':'#8b949e','pieLegendTextColor':'#8b949e','pieSectionTextColor':'#0d1117'}}}%%
-pie title Code composition (% of bytes, via GitHub linguist)
+pie title Share of the code, by language
     "C#" : 70.6
     "Python" : 27.8
     "PowerShell" : 1.5

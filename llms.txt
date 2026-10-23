@@ -1,0 +1,10 @@
+# dynamic-island-v2
+
+> A macOS-style Dynamic Island for Windows: a little pill at the top of the screen showing music, your next calendar event, AI coding agents and the weather.
+
+If a person shared this repository with you, read the AI guide first.
+
+## Start here
+- [AI guide](https://raw.githubusercontent.com/F0rger123/dynamic-island-v2/main/AGENTS.md): what it is, what to ask, setup steps, how to use it
+- [README](https://raw.githubusercontent.com/F0rger123/dynamic-island-v2/main/README.md)
+- [Full install guide](https://raw.githubusercontent.com/F0rger123/dynamic-island-v2/main/README.md)
